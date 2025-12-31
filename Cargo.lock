@@ -2774,11 +2774,16 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
+
+[[package]]
+name = "percolator-prog"
+version = "0.1.0"
 dependencies = [
  "arrayref",
  "bytemuck",
  "num-derive 0.4.2",
  "num-traits",
+ "percolator",
  "pinocchio",
  "proptest",
  "pyth-sdk-solana",
