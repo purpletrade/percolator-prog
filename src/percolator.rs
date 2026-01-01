@@ -910,7 +910,7 @@ pub mod processor {
                 accounts::expect_signer(a_lp)?;
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_context)?;
-                // LP signer verified by PDA check
+                if a_context.executable { return Err(ProgramError::InvalidAccountData); }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -943,7 +943,7 @@ pub mod processor {
 
                 let lp_account_id = engine.accounts[lp_idx as usize].account_id;
                 
-                let mut cpi_data = alloc::vec::Vec::with_capacity(51);
+                let mut cpi_data = alloc::vec::Vec::with_capacity(67);
                 cpi_data.push(0);
                 cpi_data.extend_from_slice(a_slab.key.as_ref());
                 cpi_data.extend_from_slice(&lp_idx.to_le_bytes());
@@ -970,14 +970,13 @@ pub mod processor {
                 let bump_arr = [bump];
                 let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
                 
-                let mut cpi_infos: alloc::vec::Vec<AccountInfo> = alloc::vec::Vec::with_capacity(4 + (accounts.len().saturating_sub(8)));
+                let mut cpi_infos: alloc::vec::Vec<AccountInfo> = alloc::vec::Vec::with_capacity(3 + (accounts.len().saturating_sub(8)));
                 cpi_infos.push(a_slab.clone());
                 cpi_infos.push(a_lp_signer.clone());
                 cpi_infos.push(a_context.clone());
                 for i in 8..accounts.len() {
                     cpi_infos.push(accounts[i].clone());
                 }
-                cpi_infos.push(a_matcher.clone());
 
                 invoke_signed(&ix, &cpi_infos, &[seeds])?;
 
@@ -1105,6 +1104,7 @@ pub mod risk {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     extern crate alloc;
     use alloc::{vec, vec::Vec};
     use super::*;
@@ -1113,6 +1113,7 @@ mod tests {
         pubkey::Pubkey,
         clock::Clock,
         program_pack::Pack,
+        program_error::ProgramError,
     };
     use spl_token::state::{Account as TokenAccount, AccountState};
     use crate::{
@@ -1299,6 +1300,14 @@ mod tests {
         data
     }
 
+    fn encode_trade_cpi(lp: u16, user: u16, size: i128) -> Vec<u8> {
+        let mut data = vec![10u8];
+        encode_u16(lp, &mut data);
+        encode_u16(user, &mut data);
+        encode_i128(size, &mut data);
+        data
+    }
+
     fn find_idx_by_owner(data: &[u8], owner: Pubkey) -> Option<u16> {
         let engine = zc::engine_ref(data).ok()?;
         for i in 0..MAX_ACCOUNTS {
@@ -1307,6 +1316,80 @@ mod tests {
             }
         }
         None
+    }
+
+    // --- Tests ---
+
+    #[test]
+    fn test_trade_cpi_pda_derivation() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 1000)).writable();
+        let mut matcher_program = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let mut matcher_ctx = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        {
+            let matcher_prog_key = matcher_program.key;
+            let matcher_ctx_key = matcher_ctx.key;
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                matcher_program.to_info(), matcher_ctx.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
+        }
+        let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+
+        // TradeCpi
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (lp_pda, _) = Pubkey::find_program_address(
+            &[b"lp", f.slab.key.as_ref(), &lp_bytes],
+            &f.program_id
+        );
+        let mut lp_pda_acc = TestAccount::new(lp_pda, solana_program::system_program::id(), 0, vec![]); // signer verified in processor
+
+        // Matcher context needs 24 bytes
+        matcher_ctx.data = vec![0u8; 24];
+        matcher_ctx.is_writable = true;
+
+        let accs = vec![
+            user.to_info(), // 0
+            lp.to_info(), // 1
+            f.slab.to_info(), // 2
+            f.clock.to_info(), // 3
+            f.pyth_index.to_info(), // 4 oracle
+            matcher_program.to_info(), // 5 matcher
+            matcher_ctx.to_info(), // 6 context
+            lp_pda_acc.to_info(), // 7 lp_signer_pda
+        ];
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
+        }));
+        
+        let inner = res.unwrap(); // Expect no panic
+        if let Err(ProgramError::Custom(15)) = inner {
+            panic!("PDA check failed (Unauthorized)");
+        }
     }
 
     // --- Tests ---
