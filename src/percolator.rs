@@ -767,10 +767,9 @@ pub mod processor {
                 check_idx(engine, user_idx)?;
 
                 let owner = engine.accounts[user_idx as usize].owner;
-                // Temporarily disabled check
-                // if Pubkey::new_from_array(owner) != *a_user.key {
-                //    return Err(PercolatorError::EngineUnauthorized.into());
-                // }
+                if Pubkey::new_from_array(owner) != *a_user.key {
+                   return Err(PercolatorError::EngineUnauthorized.into());
+                }
 
                 accounts::expect_key(a_oracle_idx, &Pubkey::new_from_array(config.index_oracle))?;
 
@@ -859,9 +858,9 @@ pub mod processor {
                 check_idx(engine, user_idx)?;
 
                 let u_owner = engine.accounts[user_idx as usize].owner;
-                // if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
                 let l_owner = engine.accounts[lp_idx as usize].owner;
-                // if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
 
                 let clock = Clock::from_account_info(&accounts[3])?;
                 let price = oracle::read_pyth_price_e6(&accounts[4], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;

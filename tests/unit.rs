@@ -427,4 +427,113 @@ mod tests {
         let engine = zc::engine_ref(&f.slab.data).unwrap();
         // Trade executed
     }
+
+    #[test]
+    fn test_withdraw_wrong_signer() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 0);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Deposit
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 500)).unwrap();
+        }
+
+        // Withdraw with WRONG signer
+        let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut vault_pda = TestAccount::new(f.vault_pda, solana_program::system_program::id(), 0, vec![]);
+        
+        let accounts = vec![
+            attacker.to_info(), // Wrong signer
+            f.slab.to_info(), f.vault.to_info(), user_ata.to_info(), vault_pda.to_info(),
+            f.token_prog.to_info(), f.clock.to_info(), f.pyth_index.to_info()
+        ];
+        
+        let res = process_instruction(&f.program_id, &accounts, &encode_withdraw(user_idx, 100));
+        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+    }
+
+    #[test]
+    fn test_trade_wrong_signer() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_deposit(user_idx, 1000)).unwrap();
+        }
+
+        let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 1000)).writable();
+        let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        {
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(), d1.to_info(), d2.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_lp(Pubkey::default(), Pubkey::default(), 0)).unwrap();
+        }
+        let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+        {
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_deposit(lp_idx, 1000)).unwrap();
+        }
+
+        // Trade with wrong signer
+        let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let trade_data = encode_trade(lp_idx, user_idx, 100);
+        
+        // Attacker as user
+        {
+            let accs = vec![
+                attacker.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            let res = process_instruction(&f.program_id, &accs, &trade_data);
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+    }
 }
