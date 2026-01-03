@@ -82,46 +82,72 @@ pub mod constants {
 }
 
 // 1b. Risk metric helpers (pure functions for anti-DoS threshold calculation)
-/// Compute system risk units: max_concentration + sum_abs/8.
-/// max_concentration = max(abs(LP position_size))
-/// sum_abs = sum(abs(LP position)) - captures distributed OI
-/// Only LP accounts are counted (kind == AccountKind::LP).
-fn compute_system_risk_units(engine: &percolator::RiskEngine) -> u128 {
-    let mut sum_abs: u128 = 0;
-    let mut max_abs: u128 = 0;
-    for i in 0..percolator::MAX_ACCOUNTS {
-        if engine.is_used(i) && engine.accounts[i].is_lp() {
-            let pos: i128 = engine.accounts[i].position_size;
-            let abs_pos = pos.unsigned_abs();
-            sum_abs = sum_abs.saturating_add(abs_pos);
-            max_abs = max_abs.max(abs_pos);
-        }
-    }
-    // max_concentration + sum_abs/8 makes "split across LPs" still increase risk
-    max_abs.saturating_add(sum_abs / 8)
+
+/// LP risk state: (sum_abs, max_abs) over all LP positions.
+/// O(n) scan, but called once per instruction then used for O(1) delta checks.
+struct LpRiskState {
+    sum_abs: u128,
+    max_abs: u128,
 }
 
-/// Returns true if the trade would INCREASE system risk (LP exposure).
-/// Called before trade execution with proposed delta on one LP position.
-/// Note: delta should be the LP's position change (negative of user's trade size).
-fn trade_increases_risk(engine: &percolator::RiskEngine, lp_idx: u32, delta: i128) -> bool {
-    let old_risk = compute_system_risk_units(engine);
-    // Simulate new risk after trade - only LP positions matter
-    let mut sum_abs: u128 = 0;
-    let mut max_abs: u128 = 0;
-    for i in 0..percolator::MAX_ACCOUNTS {
-        if engine.is_used(i) && engine.accounts[i].is_lp() {
-            let mut pos: i128 = engine.accounts[i].position_size;
-            if i == lp_idx as usize {
-                pos = pos.saturating_add(delta);
+impl LpRiskState {
+    /// Scan all LP accounts to compute aggregate risk state. O(MAX_ACCOUNTS).
+    fn compute(engine: &percolator::RiskEngine) -> Self {
+        let mut sum_abs: u128 = 0;
+        let mut max_abs: u128 = 0;
+        for i in 0..percolator::MAX_ACCOUNTS {
+            if engine.is_used(i) && engine.accounts[i].is_lp() {
+                let abs_pos = engine.accounts[i].position_size.unsigned_abs();
+                sum_abs = sum_abs.saturating_add(abs_pos);
+                max_abs = max_abs.max(abs_pos);
             }
-            let abs_pos = pos.unsigned_abs();
-            sum_abs = sum_abs.saturating_add(abs_pos);
-            max_abs = max_abs.max(abs_pos);
         }
+        Self { sum_abs, max_abs }
     }
-    let new_risk = max_abs.saturating_add(sum_abs / 8);
-    new_risk > old_risk
+
+    /// Current risk metric: max_concentration + sum_abs/8
+    #[inline]
+    fn risk(&self) -> u128 {
+        self.max_abs.saturating_add(self.sum_abs / 8)
+    }
+
+    /// O(1) check: would applying delta to LP at lp_idx increase system risk?
+    /// delta is the LP's position change (negative of user's trade size).
+    /// Conservative: when LP was max and shrinks, we keep max_abs (overestimates risk, safe).
+    #[inline]
+    fn would_increase_risk(&self, old_lp_pos: i128, delta: i128) -> bool {
+        let old_lp_abs = old_lp_pos.unsigned_abs();
+        let new_lp_pos = old_lp_pos.saturating_add(delta);
+        let new_lp_abs = new_lp_pos.unsigned_abs();
+
+        // Update sum_abs in O(1)
+        let new_sum_abs = self.sum_abs
+            .saturating_sub(old_lp_abs)
+            .saturating_add(new_lp_abs);
+
+        // Update max_abs in O(1) (conservative when LP was max and shrinks)
+        let new_max_abs = if new_lp_abs >= self.max_abs {
+            // LP becomes new max (or ties)
+            new_lp_abs
+        } else if old_lp_abs == self.max_abs && new_lp_abs < old_lp_abs {
+            // LP was max and shrunk - we don't know second-largest without scan.
+            // Conservative: keep old max (overestimates risk, which is safe for gating).
+            self.max_abs
+        } else {
+            // LP wasn't max, stays not max
+            self.max_abs
+        };
+
+        let old_risk = self.risk();
+        let new_risk = new_max_abs.saturating_add(new_sum_abs / 8);
+        new_risk > old_risk
+    }
+}
+
+/// Compute system risk units for threshold calculation. O(MAX_ACCOUNTS).
+/// Used by KeeperCrank for threshold updates.
+fn compute_system_risk_units(engine: &percolator::RiskEngine) -> u128 {
+    LpRiskState::compute(engine).risk()
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -1265,10 +1291,13 @@ pub mod processor {
 
                 // Gate: if insurance_fund < threshold, only allow risk-reducing trades
                 // LP delta is -size (LP takes opposite side of user's trade)
+                // O(1) check after single O(n) scan
                 let bal = engine.insurance_fund.balance;
                 let thr = engine.risk_reduction_threshold();
                 if bal < thr {
-                    if crate::trade_increases_risk(engine, lp_idx as u32, -size) {
+                    let risk_state = crate::LpRiskState::compute(engine);
+                    let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
+                    if risk_state.would_increase_risk(old_lp_pos, -size) {
                         return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                     }
                 }
@@ -1340,16 +1369,6 @@ pub mod processor {
                     if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
                     let l_owner = engine.accounts[lp_idx as usize].owner;
                     if Pubkey::new_from_array(l_owner) != *a_lp_owner.key { return Err(PercolatorError::EngineUnauthorized.into()); }
-
-                    // Pre-CPI gate: cheap early reject if insurance is low and trade would increase risk
-                    // Authoritative gate is post-CPI using actual exec_size
-                    let bal = engine.insurance_fund.balance;
-                    let thr = engine.risk_reduction_threshold();
-                    if bal < thr {
-                        if crate::trade_increases_risk(engine, lp_idx as u32, -size) {
-                            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
-                        }
-                    }
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
                     (lp_acc.account_id, config, req_id, lp_acc.matcher_program, lp_acc.matcher_context)
@@ -1423,10 +1442,13 @@ pub mod processor {
 
                     // Gate: if insurance_fund < threshold, only allow risk-reducing trades
                     // Use actual exec_size from matcher (LP delta is -exec_size)
+                    // O(1) check after single O(n) scan
                     let bal = engine.insurance_fund.balance;
                     let thr = engine.risk_reduction_threshold();
                     if bal < thr {
-                        if crate::trade_increases_risk(engine, lp_idx as u32, -ret.exec_size) {
+                        let risk_state = crate::LpRiskState::compute(engine);
+                        let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
+                        if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
                             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                         }
                     }
