@@ -491,7 +491,7 @@ fn add_lp_pdas(pt: &mut ProgramTest, slab: &Pubkey, prog: &Pubkey, n: u16) {
 }
 
 /// Test: Two consecutive trades have different req_ids (nonces increment)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn integration_nonce_increments() {
     let percolator_id = PERCOLATOR_ID;
     let matcher_id = Pubkey::new_unique();
@@ -646,20 +646,23 @@ fn malicious_replay_matcher_process_instruction(
     if data.len() != MATCHER_CALL_LEN { return Err(ProgramError::InvalidInstructionData); }
     if data[0] != MATCHER_CALL_TAG { return Err(ProgramError::InvalidInstructionData); }
 
-    let _req_id = u64::from_le_bytes(data[CALL_OFF_REQ_ID..CALL_OFF_REQ_ID+8].try_into().unwrap());
+    let req_id = u64::from_le_bytes(data[CALL_OFF_REQ_ID..CALL_OFF_REQ_ID+8].try_into().unwrap());
     let lp_account_id = u64::from_le_bytes(data[CALL_OFF_LP_ACCOUNT_ID..CALL_OFF_LP_ACCOUNT_ID+8].try_into().unwrap());
     let oracle_price_e6 = u64::from_le_bytes(data[CALL_OFF_ORACLE_PRICE..CALL_OFF_ORACLE_PRICE+8].try_into().unwrap());
     let req_size = i128::from_le_bytes(data[CALL_OFF_REQ_SIZE..CALL_OFF_REQ_SIZE+16].try_into().unwrap());
 
-    // MALICIOUS: return req_id = 0 instead of echoing the actual req_id
-    let bad_req_id = 0u64;
+    // MALICIOUS: replay the first req_id on subsequent trades
+    // Trade 1 (req_id=1): returns 1 (correct) → succeeds
+    // Trade 2 (req_id=2): returns 1 (replay) → fails
+    let bad_req_id = if req_id > 1 { 1u64 } else { req_id };
 
     {
         let mut ctx = a_ctx.try_borrow_mut_data()?;
         ctx[0..64].fill(0);
 
+        let flags = if req_size == 0 { 1u32 | 2u32 } else { 1u32 };
         ctx[RET_OFF_ABI_VERSION..RET_OFF_ABI_VERSION+4].copy_from_slice(&MATCHER_ABI_VERSION.to_le_bytes());
-        ctx[RET_OFF_FLAGS..RET_OFF_FLAGS+4].copy_from_slice(&1u32.to_le_bytes()); // VALID
+        ctx[RET_OFF_FLAGS..RET_OFF_FLAGS+4].copy_from_slice(&flags.to_le_bytes());
         ctx[RET_OFF_EXEC_PRICE..RET_OFF_EXEC_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
         ctx[RET_OFF_EXEC_SIZE..RET_OFF_EXEC_SIZE+16].copy_from_slice(&req_size.to_le_bytes());
         ctx[RET_OFF_REQ_ID..RET_OFF_REQ_ID+8].copy_from_slice(&bad_req_id.to_le_bytes()); // WRONG!
@@ -670,8 +673,8 @@ fn malicious_replay_matcher_process_instruction(
     Ok(())
 }
 
-/// Test: Malicious matcher returns wrong req_id → trade fails, nonce does not advance
-#[tokio::test]
+/// Test: Malicious matcher replays old req_id → second trade fails, nonce does not advance
+#[tokio::test(flavor = "multi_thread")]
 async fn integration_replay_req_id_rejected() {
     let percolator_id = PERCOLATOR_ID;
     let malicious_matcher_id = Pubkey::new_unique();
@@ -756,28 +759,49 @@ async fn integration_replay_req_id_rejected() {
     let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(lp_idx, 0, 0) };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
 
-    // Record nonce before failed trade
+    // Record nonce before any trade
     use percolator_prog::state::RESERVED_OFF;
     let slab_before = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
     let nonce_before = u64::from_le_bytes(slab_before.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
     assert_eq!(nonce_before, 0, "nonce should be 0 before any trade");
 
-    // Attempt trade with malicious matcher → should fail
     let (lp_pda, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &lp_idx.to_le_bytes()], &percolator_id);
-    let ix = Instruction {
+
+    // Trade 1: should SUCCEED (req_id=1, malicious matcher returns 1)
+    let ix1 = Instruction {
         program_id: percolator_id,
         accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false), AccountMeta::new_readonly(malicious_matcher_id, false), AccountMeta::new(malicious_ctx.pubkey(), false), AccountMeta::new_readonly(lp_pda, false)],
         data: encode_trade_cpi(lp_idx, user_idx, 50),
     };
-    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
-    tx.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
-    let err = banks.process_transaction(tx).await.unwrap_err();
+    let mut tx1 = Transaction::new_with_payer(&[ix1], Some(&payer.pubkey()));
+    tx1.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx1).await.unwrap();
 
-    // Should fail with InvalidAccountData (bad req_id echo)
+    // Verify nonce advanced to 1 after first successful trade
+    let slab_after1 = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let nonce_after1 = u64::from_le_bytes(slab_after1.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
+    assert_eq!(nonce_after1, 1, "nonce should be 1 after first successful trade");
+
+    // Verify malicious_ctx contains req_id=1
+    let ctx_after1 = banks.get_account(malicious_ctx.pubkey()).await.unwrap().unwrap();
+    let req_id_in_ctx = u64::from_le_bytes(ctx_after1.data[RET_OFF_REQ_ID..RET_OFF_REQ_ID+8].try_into().unwrap());
+    assert_eq!(req_id_in_ctx, 1, "matcher context should have req_id=1");
+
+    // Trade 2: should FAIL (program expects req_id=2, malicious matcher replays req_id=1)
+    let ix2 = Instruction {
+        program_id: percolator_id,
+        accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false), AccountMeta::new_readonly(malicious_matcher_id, false), AccountMeta::new(malicious_ctx.pubkey(), false), AccountMeta::new_readonly(lp_pda, false)],
+        data: encode_trade_cpi(lp_idx, user_idx, 50),
+    };
+    let mut tx2 = Transaction::new_with_payer(&[ix2], Some(&payer.pubkey()));
+    tx2.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
+    let err = banks.process_transaction(tx2).await.unwrap_err();
+
+    // Should fail with InvalidAccountData (replayed req_id=1 instead of expected req_id=2)
     assert!(format!("{err:?}").contains("InvalidAccountData"), "Expected InvalidAccountData, got: {err:?}");
 
-    // Verify nonce did NOT advance
-    let slab_after = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
-    let nonce_after = u64::from_le_bytes(slab_after.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
-    assert_eq!(nonce_after, 0, "nonce should still be 0 after failed trade");
+    // Verify nonce did NOT advance on failed trade - should still be 1
+    let slab_after2 = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let nonce_after2 = u64::from_le_bytes(slab_after2.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
+    assert_eq!(nonce_after2, 1, "nonce should remain 1 after failed replay trade");
 }
