@@ -12,23 +12,26 @@ declare_id!("Perco1ator111111111111111111111111111111111");
 
 // 1. mod constants
 pub mod constants {
-    use core::mem::{size_of, align_of};
+    use core::mem::size_of;
     use crate::state::MarketConfig;
-    use percolator::RiskEngine;
+    // Use production constants from percolator crate for machine-independent sizes
+    use percolator::PROD_ENGINE_SIZE;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
     pub const VERSION: u32 = 1;
-    
+
     pub const HEADER_LEN: usize = 64;
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
-    pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
+    /// Engine alignment (same regardless of MAX_ACCOUNTS)
+    pub const ENGINE_ALIGN: usize = percolator::ENGINE_ALIGN;
 
     pub const fn align_up(x: usize, a: usize) -> usize {
         (x + (a - 1)) & !(a - 1)
     }
 
+    // Use production engine size (always 4096 accounts) for machine-independent slab sizing
     pub const ENGINE_OFF: usize = align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN);
-    pub const ENGINE_LEN: usize = size_of::<RiskEngine>();
+    pub const ENGINE_LEN: usize = PROD_ENGINE_SIZE;
     pub const SLAB_LEN: usize = ENGINE_OFF + ENGINE_LEN;
     pub const MATCHER_ABI_VERSION: u32 = 1;
     pub const MATCHER_CONTEXT_PREFIX_LEN: usize = 64;
@@ -1341,6 +1344,7 @@ pub mod processor {
             if slab.owner != program_id {
                 return Err(ProgramError::IllegalOwner);
             }
+            solana_program::log::sol_log_64(SLAB_LEN as u64, data.len() as u64, 0, 0, 0);
             return Err(PercolatorError::InvalidSlabLen.into());
         }
         Ok(())
