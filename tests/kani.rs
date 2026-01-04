@@ -17,6 +17,8 @@
 
 #![cfg(kani)]
 
+extern crate kani;
+
 // Import real types and helpers from the program crate
 use percolator_prog::matcher_abi::{
     MatcherReturn, validate_matcher_return, FLAG_VALID, FLAG_PARTIAL_OK, FLAG_REJECTED,
@@ -1008,10 +1010,132 @@ fn kani_matcher_zero_size_with_partial_ok_accepted() {
 
     let lp_account_id: u64 = ret.lp_account_id;
     let oracle_price: u64 = ret.oracle_price_e6;
+    // When exec_size == 0, validate_matcher_return returns early before abs() checks
+    // so req_size can be any value including i128::MIN
     let req_size: i128 = kani::any();
-    kani::assume(req_size != 0); // Request must be non-zero
     let req_id: u64 = ret.req_id;
 
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
     assert!(result.is_ok(), "zero exec_size with PARTIAL_OK must be accepted");
+}
+
+// =============================================================================
+// O. MISSING SHAPE COUPLING PROOFS (2 proofs)
+// =============================================================================
+
+/// Prove: TradeCpi rejects on bad matcher shape (ctx owner mismatch)
+#[kani::proof]
+fn kani_tradecpi_rejects_ctx_owner_mismatch() {
+    let old_nonce: u64 = kani::any();
+    let shape = MatcherAccountsShape {
+        prog_executable: true,
+        ctx_executable: false,
+        ctx_owner_is_prog: false, // BAD - context not owned by program
+        ctx_len_ok: true,
+    };
+    let exec_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi(
+        old_nonce, shape, true, true, true, true, true, false, false, exec_size
+    );
+
+    assert_eq!(decision, TradeCpiDecision::Reject,
+        "TradeCpi must reject when context not owned by matcher program");
+}
+
+/// Prove: TradeCpi rejects on bad matcher shape (ctx too short)
+#[kani::proof]
+fn kani_tradecpi_rejects_ctx_len_short() {
+    let old_nonce: u64 = kani::any();
+    let shape = MatcherAccountsShape {
+        prog_executable: true,
+        ctx_executable: false,
+        ctx_owner_is_prog: true,
+        ctx_len_ok: false, // BAD - context length insufficient
+    };
+    let exec_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi(
+        old_nonce, shape, true, true, true, true, true, false, false, exec_size
+    );
+
+    assert_eq!(decision, TradeCpiDecision::Reject,
+        "TradeCpi must reject when context length insufficient");
+}
+
+// =============================================================================
+// P. UNIVERSAL REJECT => NONCE UNCHANGED (1 proof)
+// This subsumes all specific "reject => nonce unchanged" proofs
+// =============================================================================
+
+/// Prove: ANY TradeCpi rejection leaves nonce unchanged (universal quantification)
+#[kani::proof]
+fn kani_tradecpi_any_reject_nonce_unchanged() {
+    let old_nonce: u64 = kani::any();
+
+    // Build shape from symbolic bools (MatcherAccountsShape doesn't impl kani::Arbitrary)
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let abi_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let gate_active: bool = kani::any();
+    let risk_increase: bool = kani::any();
+    let exec_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi(
+        old_nonce, shape, identity_ok, pda_ok, abi_ok,
+        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+    );
+
+    // Only consider rejection cases
+    kani::assume(matches!(decision, TradeCpiDecision::Reject));
+
+    // For ANY rejection, nonce must be unchanged
+    let result_nonce = decision_nonce(old_nonce, decision);
+    assert_eq!(result_nonce, old_nonce,
+        "ANY TradeCpi rejection must leave nonce unchanged");
+}
+
+/// Prove: ANY TradeCpi acceptance increments nonce (universal quantification)
+#[kani::proof]
+fn kani_tradecpi_any_accept_increments_nonce() {
+    let old_nonce: u64 = kani::any();
+
+    // Build shape from symbolic bools
+    let shape = MatcherAccountsShape {
+        prog_executable: kani::any(),
+        ctx_executable: kani::any(),
+        ctx_owner_is_prog: kani::any(),
+        ctx_len_ok: kani::any(),
+    };
+
+    let identity_ok: bool = kani::any();
+    let pda_ok: bool = kani::any();
+    let abi_ok: bool = kani::any();
+    let user_auth_ok: bool = kani::any();
+    let lp_auth_ok: bool = kani::any();
+    let gate_active: bool = kani::any();
+    let risk_increase: bool = kani::any();
+    let exec_size: i128 = kani::any();
+
+    let decision = decide_trade_cpi(
+        old_nonce, shape, identity_ok, pda_ok, abi_ok,
+        user_auth_ok, lp_auth_ok, gate_active, risk_increase, exec_size
+    );
+
+    // Only consider acceptance cases
+    kani::assume(matches!(decision, TradeCpiDecision::Accept { .. }));
+
+    // For ANY acceptance, nonce must increment by 1
+    let result_nonce = decision_nonce(old_nonce, decision);
+    assert_eq!(result_nonce, old_nonce.wrapping_add(1),
+        "ANY TradeCpi acceptance must increment nonce by 1");
 }

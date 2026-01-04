@@ -4,8 +4,8 @@
 
 **Date:** 2026-01-04
 **Kani Version:** 0.66.0
-**Total Proofs:** 56
-**Passed:** 56
+**Total Proofs:** 60
+**Passed:** 60
 **Failed:** 0
 
 ## Proof Categories
@@ -122,6 +122,20 @@ These prove program-level policies via the `decide_trade_cpi` decision helper.
 | kani_tradenocpi_rejects_lp_auth_failure | LP auth failure -> reject |
 | kani_tradenocpi_rejects_gate_risk_increase | Gate active + risk increase -> reject |
 | kani_tradenocpi_accepts_valid | All checks pass -> accept |
+
+### N. Additional Shape Coupling (2 proofs)
+| Harness | Property |
+|---------|----------|
+| kani_tradecpi_rejects_ctx_owner_mismatch | Context not owned by program -> reject |
+| kani_tradecpi_rejects_ctx_len_short | Context length insufficient -> reject |
+
+### O. Universal Nonce Properties (2 proofs) - CRITICAL
+These subsume all specific nonce proofs with universal quantification.
+
+| Harness | Property |
+|---------|----------|
+| kani_tradecpi_any_reject_nonce_unchanged | ANY rejection -> nonce unchanged |
+| kani_tradecpi_any_accept_increments_nonce | ANY acceptance -> nonce += 1 |
 
 ## Key Security Properties Proven
 
