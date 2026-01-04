@@ -2,7 +2,7 @@
 
 ## Kani Proofs Summary
 
-**Date:** 2026-01-03
+**Date:** 2026-01-04
 **Kani Version:** 0.66.0
 **Total Proofs:** 35
 **Passed:** 35
@@ -113,7 +113,7 @@ Risk engine internals are NOT modeled - only wrapper authorization and binding l
 
 ## Implementation: pub mod verify
 
-Pure helpers added to percolator.rs for Kani verification:
+Pure helpers in percolator.rs, **wired into actual instruction handlers**:
 
 ```rust
 pub mod verify {
@@ -121,6 +121,7 @@ pub mod verify {
     pub fn admin_ok(admin, signer) -> bool
     pub fn matcher_identity_ok(lp_prog, lp_ctx, provided_prog, provided_ctx) -> bool
     pub fn matcher_shape_ok(shape: MatcherAccountsShape) -> bool
+    pub fn ctx_len_sufficient(len: usize) -> bool
     pub fn gate_active(threshold, balance) -> bool
     pub fn nonce_on_success(old) -> u64
     pub fn nonce_on_failure(old) -> u64
@@ -129,6 +130,21 @@ pub mod verify {
     pub fn crank_authorized(idx_exists, stored_owner, signer) -> bool
 }
 ```
+
+### Helper Wiring (Instruction → verify::)
+
+| Instruction | Helpers Used |
+|-------------|--------------|
+| DepositCollateral | `owner_ok` |
+| WithdrawCollateral | `owner_ok` |
+| TradeNoCpi | `owner_ok` (x2), `gate_active` |
+| TradeCpi | `matcher_shape_ok`, `ctx_len_sufficient`, `owner_ok` (x2), `matcher_identity_ok`, `nonce_on_success`, `gate_active`, `cpi_trade_size` |
+| CloseAccount | `owner_ok` |
+| KeeperCrank | `crank_authorized` |
+| SetRiskThreshold | `admin_ok` (via require_admin) |
+| UpdateAdmin | `admin_ok` (via require_admin) |
+
+**Note:** Kani proofs now verify properties of the same code paths the program actually executes.
 
 ## What is NOT Proven
 

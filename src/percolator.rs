@@ -1000,12 +1000,9 @@ pub mod processor {
 
     /// Require that the signer is the current admin.
     /// If admin is burned (all zeros), admin operations are permanently disabled.
+    /// Admin authorization via verify helper (Kani-provable)
     fn require_admin(header_admin: [u8; 32], signer: &Pubkey) -> Result<(), ProgramError> {
-        if header_admin == [0u8; 32] {
-            // admin burned/finalized: nobody can do admin ops
-            return Err(PercolatorError::EngineUnauthorized.into());
-        }
-        if header_admin != signer.to_bytes() {
+        if !crate::verify::admin_ok(header_admin, signer.to_bytes()) {
             return Err(PercolatorError::EngineUnauthorized.into());
         }
         Ok(())
@@ -1233,8 +1230,9 @@ pub mod processor {
 
                 check_idx(engine, user_idx)?;
 
+                // Owner authorization via verify helper (Kani-provable)
                 let owner = engine.accounts[user_idx as usize].owner;
-                if Pubkey::new_from_array(owner) != *a_user.key {
+                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
@@ -1266,9 +1264,10 @@ pub mod processor {
 
                 check_idx(engine, user_idx)?;
 
+                // Owner authorization via verify helper (Kani-provable)
                 let owner = engine.accounts[user_idx as usize].owner;
-                if Pubkey::new_from_array(owner) != *a_user.key {
-                   return Err(PercolatorError::EngineUnauthorized.into());
+                if !crate::verify::owner_ok(owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
                 accounts::expect_key(a_oracle_idx, &Pubkey::new_from_array(config.index_oracle))?;
@@ -1326,13 +1325,15 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
 
-                if (caller_idx as usize) < MAX_ACCOUNTS { 
-                     if engine.is_used(caller_idx as usize) {
-                         let owner = engine.accounts[caller_idx as usize].owner;
-                         if Pubkey::new_from_array(owner) != *a_caller.key {
-                             return Err(PercolatorError::EngineUnauthorized.into());
-                         }
-                     }
+                // Crank authorization via verify helper (Kani-provable)
+                let idx_exists = (caller_idx as usize) < MAX_ACCOUNTS && engine.is_used(caller_idx as usize);
+                let stored_owner = if idx_exists {
+                    engine.accounts[caller_idx as usize].owner
+                } else {
+                    [0u8; 32] // Doesn't matter for non-existent accounts
+                };
+                if !crate::verify::crank_authorized(idx_exists, stored_owner, a_caller.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
@@ -1392,10 +1393,15 @@ pub mod processor {
                 check_idx(engine, lp_idx)?;
                 check_idx(engine, user_idx)?;
 
+                // Owner authorization via verify helper (Kani-provable)
                 let u_owner = engine.accounts[user_idx as usize].owner;
-                if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
                 let l_owner = engine.accounts[lp_idx as usize].owner;
-                if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                if !crate::verify::owner_ok(l_owner, a_lp.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
 
                 let clock = Clock::from_account_info(&accounts[3])?;
                 let price = oracle::read_pyth_price_e6(&accounts[4], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
@@ -1403,10 +1409,10 @@ pub mod processor {
                 // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                 // LP delta is -size (LP takes opposite side of user's trade)
                 // O(1) check after single O(n) scan
-                // Note: thr > 0 check ensures threshold=0 means "no gating"
+                // Gate activation via verify helper (Kani-provable)
                 let bal = engine.insurance_fund.balance;
                 let thr = engine.risk_reduction_threshold();
-                if thr > 0 && bal <= thr {
+                if crate::verify::gate_active(thr, bal) {
                     let risk_state = crate::LpRiskState::compute(engine);
                     let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                     if risk_state.would_increase_risk(old_lp_pos, -size) {
@@ -1433,10 +1439,16 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_matcher_ctx)?;
 
-                if !a_matcher_prog.executable { return Err(ProgramError::InvalidAccountData); }
-                if a_matcher_ctx.executable { return Err(ProgramError::InvalidAccountData); }
-                if a_matcher_ctx.owner != a_matcher_prog.key { return Err(ProgramError::IllegalOwner); }
-                if a_matcher_ctx.data_len() < MATCHER_CONTEXT_LEN { return Err(ProgramError::InvalidAccountData); }
+                // Matcher shape validation via verify helper (Kani-provable)
+                let matcher_shape = crate::verify::MatcherAccountsShape {
+                    prog_executable: a_matcher_prog.executable,
+                    ctx_executable: a_matcher_ctx.executable,
+                    ctx_owner_is_prog: a_matcher_ctx.owner == a_matcher_prog.key,
+                    ctx_len_ok: crate::verify::ctx_len_sufficient(a_matcher_ctx.data_len()),
+                };
+                if !crate::verify::matcher_shape_ok(matcher_shape) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 // Phase 1: Validate lp_pda is the correct PDA, system-owned, empty data, 0 lamports
                 let lp_bytes = lp_idx.to_le_bytes();
@@ -1468,29 +1480,36 @@ pub mod processor {
                     let config = state::read_config(&*data);
 
                     // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
-                    // Use wrapping_add - nonce is just freshness, wrapping is fine and deterministic
+                    // Nonce advancement via verify helper (Kani-provable)
                     let nonce = state::read_req_nonce(&*data);
-                    let req_id = nonce.wrapping_add(1);
+                    let req_id = crate::verify::nonce_on_success(nonce);
 
                     let engine = zc::engine_ref(&*data)?;
 
                     check_idx(engine, lp_idx)?;
                     check_idx(engine, user_idx)?;
 
+                    // Owner authorization via verify helper (Kani-provable)
                     let u_owner = engine.accounts[user_idx as usize].owner;
-                    if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                    if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
                     let l_owner = engine.accounts[lp_idx as usize].owner;
-                    if Pubkey::new_from_array(l_owner) != *a_lp_owner.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                    if !crate::verify::owner_ok(l_owner, a_lp_owner.key.to_bytes()) {
+                        return Err(PercolatorError::EngineUnauthorized.into());
+                    }
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
                     (lp_acc.account_id, config, req_id, lp_acc.matcher_program, lp_acc.matcher_context)
                 };
 
-                // Phase 4: Enforce matcher program/context match what LP registered
-                if a_matcher_prog.key.to_bytes() != lp_matcher_prog {
-                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
-                }
-                if a_matcher_ctx.key.to_bytes() != lp_matcher_ctx {
+                // Matcher identity binding via verify helper (Kani-provable)
+                if !crate::verify::matcher_identity_ok(
+                    lp_matcher_prog,
+                    lp_matcher_ctx,
+                    a_matcher_prog.key.to_bytes(),
+                    a_matcher_ctx.key.to_bytes(),
+                ) {
                     return Err(PercolatorError::EngineInvalidMatchingEngine.into());
                 }
 
@@ -1555,10 +1574,10 @@ pub mod processor {
                     // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
                     // Use actual exec_size from matcher (LP delta is -exec_size)
                     // O(1) check after single O(n) scan
-                    // Note: thr > 0 check ensures threshold=0 means "no gating"
+                    // Gate activation via verify helper (Kani-provable)
                     let bal = engine.insurance_fund.balance;
                     let thr = engine.risk_reduction_threshold();
-                    if thr > 0 && bal <= thr {
+                    if crate::verify::gate_active(thr, bal) {
                         let risk_state = crate::LpRiskState::compute(engine);
                         let old_lp_pos = engine.accounts[lp_idx as usize].position_size;
                         if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
@@ -1566,7 +1585,9 @@ pub mod processor {
                         }
                     }
 
-                    engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, ret.exec_size).map_err(map_risk_error)?;
+                    // Trade size selection via verify helper (Kani-provable: uses exec_size, not requested_size)
+                    let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
+                    engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size).map_err(map_risk_error)?;
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
                 }
@@ -1615,8 +1636,11 @@ pub mod processor {
 
                 check_idx(engine, user_idx)?;
 
+                // Owner authorization via verify helper (Kani-provable)
                 let u_owner = engine.accounts[user_idx as usize].owner;
-                if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+                if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
 
                 let clock = Clock::from_account_info(&accounts[6])?;
                 let price = oracle::read_pyth_price_e6(&accounts[7], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
