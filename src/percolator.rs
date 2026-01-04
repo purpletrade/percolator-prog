@@ -13,13 +13,13 @@ declare_id!("Perco1ator111111111111111111111111111111111");
 // 1. mod constants
 pub mod constants {
     use core::mem::{size_of, align_of};
-    use crate::state::MarketConfig;
+    use crate::state::{SlabHeader, MarketConfig};
     use percolator::RiskEngine;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
     pub const VERSION: u32 = 1;
 
-    pub const HEADER_LEN: usize = 64;
+    pub const HEADER_LEN: usize = size_of::<SlabHeader>();
     pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
     pub const ENGINE_ALIGN: usize = align_of::<RiskEngine>();
 
