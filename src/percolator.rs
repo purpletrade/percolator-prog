@@ -1138,12 +1138,22 @@ pub mod oracle {
     use crate::error::PercolatorError;
 
     /// Pyth mainnet price program ID
+    #[cfg(not(feature = "devnet"))]
     pub const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
         0x92, 0x6a, 0xb1, 0x3b, 0x47, 0x4a, 0x34, 0x42,
         0x91, 0xb3, 0x29, 0x67, 0xf5, 0xf5, 0x3f, 0x7e,
         0x2e, 0x3e, 0x23, 0x42, 0x2c, 0x62, 0x8d, 0x8f,
         0x5d, 0x0a, 0xd0, 0x85, 0x8c, 0x0a, 0xe0, 0x73,
     ]); // FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH
+
+    /// Pyth devnet price program ID
+    #[cfg(feature = "devnet")]
+    pub const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+        0x0a, 0x1a, 0x98, 0x33, 0xa3, 0x76, 0x55, 0x2b,
+        0x56, 0xb7, 0xca, 0x0d, 0xed, 0x19, 0x29, 0x17,
+        0x00, 0x57, 0xe8, 0x27, 0xa0, 0xc6, 0x27, 0xf4,
+        0xb6, 0x47, 0xb9, 0xee, 0x90, 0x99, 0xaf, 0xb4,
+    ]); // gSbePebfvPy7tRqimPoVecS2UsBvYv46ynrzWocc92s
 
     pub fn read_pyth_price_e6(price_ai: &AccountInfo, now_slot: u64, max_staleness: u64, conf_bps: u16) -> Result<u64, ProgramError> {
         // Validate oracle owner (skip in tests to allow mock oracles)
@@ -1168,17 +1178,29 @@ pub mod oracle {
             return Err(PercolatorError::OracleInvalid.into()); 
         }
 
-        let age = now_slot.saturating_sub(pub_slot);
-        if age > max_staleness {
-            return Err(PercolatorError::OracleStale.into());
+        // Skip staleness check on devnet since oracles aren't actively updated
+        #[cfg(not(feature = "devnet"))]
+        {
+            let age = now_slot.saturating_sub(pub_slot);
+            if age > max_staleness {
+                return Err(PercolatorError::OracleStale.into());
+            }
         }
+        #[cfg(feature = "devnet")]
+        let _ = (pub_slot, max_staleness); // Suppress unused warnings
 
         let price_u = price as u128;
-        let lhs = (conf as u128) * 10_000;
-        let rhs = price_u * (conf_bps as u128);
-        if lhs > rhs {
-            return Err(PercolatorError::OracleConfTooWide.into());
+        // Skip confidence check on devnet since oracles have unreliable confidence data
+        #[cfg(not(feature = "devnet"))]
+        {
+            let lhs = (conf as u128) * 10_000;
+            let rhs = price_u * (conf_bps as u128);
+            if lhs > rhs {
+                return Err(PercolatorError::OracleConfTooWide.into());
+            }
         }
+        #[cfg(feature = "devnet")]
+        let _ = (conf, conf_bps); // Suppress unused warnings
 
         let scale = expo + 6;
         let final_price_u128 = if scale >= 0 {
@@ -2357,6 +2379,23 @@ mod tests {
     }
 
     // --- Tests ---
+
+    #[test]
+    fn test_struct_sizes() {
+        extern crate std;
+        use std::println;
+        use percolator::{RiskEngine, Account, MAX_ACCOUNTS};
+        use core::mem::{size_of, offset_of};
+
+        println!("Size of Account: {}", size_of::<Account>());
+        println!("Offset of Account.kind: {}", offset_of!(Account, kind));
+        println!("Offset of Account.owner: {}", offset_of!(Account, owner));
+        println!("Size of RiskEngine: {}", size_of::<RiskEngine>());
+        println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
+
+        let account_array_size = MAX_ACCOUNTS * size_of::<Account>();
+        println!("Account array size: {}", account_array_size);
+    }
 
     #[test]
     fn test_init_market() {
