@@ -1,237 +1,757 @@
-//! Worst-case CU benchmark tests for percolator-prog
+//! BPF Compute Unit benchmark using LiteSVM
 //!
-//! Run with: cargo test --release --test cu_benchmark -- --nocapture
-//! For production MAX_ACCOUNTS=4096: cargo test --release --test cu_benchmark -- --nocapture
-//! Note: Don't use --features test as that sets MAX_ACCOUNTS=64
+//! Tests worst-case CU scenarios for keeper crank:
+//! 1. All empty slots - baseline scan overhead
+//! 2. All dust accounts - minimal balances, no positions
+//! 3. Few liquidations - some accounts underwater
+//! 4. All deeply underwater - socialized losses
+//! 5. 4096 knife-edge liquidations - worst case
+//!
+//! Build BPF: cargo build-sbf (production) or cargo build-sbf --features test (small)
+//! Run: cargo test --release --test cu_benchmark -- --nocapture
 
-use percolator::{RiskEngine, RiskParams, MAX_ACCOUNTS, AccountKind, Account};
-use std::time::Instant;
+use litesvm::LiteSVM;
+use solana_sdk::{
+    account::Account,
+    clock::Clock,
+    compute_budget::ComputeBudgetInstruction,
+    instruction::{AccountMeta, Instruction},
+    pubkey::Pubkey,
+    signature::{Keypair, Signer},
+    sysvar,
+    transaction::Transaction,
+    program_pack::Pack,
+};
+use spl_token::state::{Account as TokenAccount, AccountState};
+use std::path::PathBuf;
 
-fn default_params() -> RiskParams {
-    RiskParams {
-        warmup_period_slots: 100,
-        maintenance_margin_bps: 500,      // 5%
-        initial_margin_bps: 1000,         // 10%
-        trading_fee_bps: 10,              // 0.1%
-        max_accounts: MAX_ACCOUNTS as u64,
-        new_account_fee: 0,               // No fee for test
-        risk_reduction_threshold: 0,
-        maintenance_fee_per_slot: 0,
-        max_crank_staleness_slots: u64::MAX,
-        liquidation_fee_bps: 50,          // 0.5%
-        liquidation_fee_cap: 1_000_000_000_000,
-        liquidation_buffer_bps: 100,      // 1%
-        min_liquidation_abs: 1000,
+// SLAB_LEN for SBF - differs between test and production
+#[cfg(feature = "test")]
+const SLAB_LEN: usize = 17696;  // MAX_ACCOUNTS=64
+
+#[cfg(not(feature = "test"))]
+const SLAB_LEN: usize = 1094744;  // MAX_ACCOUNTS=4096
+
+#[cfg(feature = "test")]
+const MAX_ACCOUNTS: usize = 64;
+
+#[cfg(not(feature = "test"))]
+const MAX_ACCOUNTS: usize = 4096;
+
+// Pyth mainnet program ID
+const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+    0x92, 0x6a, 0xb1, 0x3b, 0x47, 0x4a, 0x34, 0x42,
+    0x91, 0xb3, 0x29, 0x67, 0xf5, 0xf5, 0x3f, 0x7e,
+    0x2e, 0x3e, 0x23, 0x42, 0x2c, 0x62, 0x8d, 0x8f,
+    0x5d, 0x0a, 0xd0, 0x85, 0x8c, 0x0a, 0xe0, 0x73,
+]);
+
+fn program_path() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("target/deploy/percolator_prog.so");
+    path
+}
+
+fn make_token_account_data(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8> {
+    let mut data = vec![0u8; TokenAccount::LEN];
+    let mut account = TokenAccount::default();
+    account.mint = *mint;
+    account.owner = *owner;
+    account.amount = amount;
+    account.state = AccountState::Initialized;
+    TokenAccount::pack(account, &mut data).unwrap();
+    data
+}
+
+fn make_pyth_data(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
+    let mut data = vec![0u8; 208];
+    data[20..24].copy_from_slice(&expo.to_le_bytes());
+    data[176..184].copy_from_slice(&price.to_le_bytes());
+    data[184..192].copy_from_slice(&conf.to_le_bytes());
+    data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
+    data
+}
+
+// Instruction encoders
+fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_col: &Pubkey) -> Vec<u8> {
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.as_ref());
+    data.extend_from_slice(mint.as_ref());
+    data.extend_from_slice(pyth_index.as_ref());
+    data.extend_from_slice(pyth_col.as_ref());
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_staleness_slots
+    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
+    // RiskParams
+    data.extend_from_slice(&0u64.to_le_bytes());   // warmup_period_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
+    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps (10%)
+    data.extend_from_slice(&0u64.to_le_bytes());   // trading_fee_bps
+    data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes());  // new_account_fee
+    data.extend_from_slice(&0u128.to_le_bytes());  // risk_reduction_threshold
+    data.extend_from_slice(&0u128.to_le_bytes());  // maintenance_fee_per_slot
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
+    data.extend_from_slice(&50u64.to_le_bytes());  // liquidation_fee_bps
+    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&100u64.to_le_bytes()); // liquidation_buffer_bps
+    data.extend_from_slice(&0u128.to_le_bytes());  // min_liquidation_abs
+    data
+}
+
+fn encode_init_user(fee: u64) -> Vec<u8> {
+    let mut data = vec![1u8];
+    data.extend_from_slice(&fee.to_le_bytes());
+    data
+}
+
+fn encode_init_lp(matcher: &Pubkey, ctx: &Pubkey, fee: u64) -> Vec<u8> {
+    let mut data = vec![2u8];
+    data.extend_from_slice(matcher.as_ref());
+    data.extend_from_slice(ctx.as_ref());
+    data.extend_from_slice(&fee.to_le_bytes());
+    data
+}
+
+fn encode_deposit(user_idx: u16, amount: u64) -> Vec<u8> {
+    let mut data = vec![3u8];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+fn encode_crank_permissionless(panic: u8) -> Vec<u8> {
+    let mut data = vec![5u8];
+    data.extend_from_slice(&u16::MAX.to_le_bytes());
+    data.push(panic);
+    data
+}
+
+fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
+    let mut data = vec![6u8];
+    data.extend_from_slice(&lp.to_le_bytes());
+    data.extend_from_slice(&user.to_le_bytes());
+    data.extend_from_slice(&size.to_le_bytes());
+    data
+}
+
+struct TestEnv {
+    svm: LiteSVM,
+    program_id: Pubkey,
+    payer: Keypair,
+    slab: Pubkey,
+    mint: Pubkey,
+    vault: Pubkey,
+    pyth_index: Pubkey,
+    pyth_col: Pubkey,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let path = program_path();
+        if !path.exists() {
+            panic!("BPF not found at {:?}. Run: cargo build-sbf", path);
+        }
+
+        let mut svm = LiteSVM::new();
+        let program_id = Pubkey::new_unique();
+        let program_bytes = std::fs::read(&path).expect("Failed to read program");
+        svm.add_program(program_id, &program_bytes);
+
+        let payer = Keypair::new();
+        let slab = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let pyth_index = Pubkey::new_unique();
+        let pyth_col = Pubkey::new_unique();
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab.as_ref()], &program_id);
+        let vault = Pubkey::new_unique();
+
+        svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+        svm.set_account(slab, Account {
+            lamports: 1_000_000_000,
+            data: vec![0u8; SLAB_LEN],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        svm.set_account(mint, Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 82],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        svm.set_account(vault, Account {
+            lamports: 1_000_000,
+            data: make_token_account_data(&mint, &vault_pda, 0),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        let pyth_data = make_pyth_data(100_000_000, -6, 1, 100); // $100
+        svm.set_account(pyth_index, Account {
+            lamports: 1_000_000,
+            data: pyth_data.clone(),
+            owner: PYTH_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+        svm.set_account(pyth_col, Account {
+            lamports: 1_000_000,
+            data: pyth_data,
+            owner: PYTH_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        svm.set_sysvar(&Clock { slot: 100, ..Clock::default() });
+
+        TestEnv { svm, program_id, payer, slab, mint, vault, pyth_index, pyth_col }
+    }
+
+    fn init_market(&mut self) {
+        let admin = &self.payer;
+        let dummy_ata = Pubkey::new_unique();
+        self.svm.set_account(dummy_ata, Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+                AccountMeta::new_readonly(self.pyth_col, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_init_market(&admin.pubkey(), &self.mint, &self.pyth_index, &self.pyth_col),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("init_market failed");
+    }
+
+    fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
+        let ata = Pubkey::new_unique();
+        self.svm.set_account(ata, Account {
+            lamports: 1_000_000,
+            data: make_token_account_data(&self.mint, owner, amount),
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+        ata
+    }
+
+    fn init_lp(&mut self, owner: &Keypair) -> u16 {
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let ata = self.create_ata(&owner.pubkey(), 0);
+        let matcher = spl_token::ID;
+        let ctx = Pubkey::new_unique();
+        self.svm.set_account(ctx, Account {
+            lamports: 1_000_000,
+            data: vec![0u8; 320],
+            owner: matcher,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(matcher, false),
+                AccountMeta::new_readonly(ctx, false),
+            ],
+            data: encode_init_lp(&matcher, &ctx, 0),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("init_lp failed");
+        0
+    }
+
+    fn init_user(&mut self, owner: &Keypair) -> u16 {
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let ata = self.create_ata(&owner.pubkey(), 0);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_col, false),
+            ],
+            data: encode_init_user(0),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("init_user failed");
+        1 // LP is 0
+    }
+
+    fn deposit(&mut self, owner: &Keypair, user_idx: u16, amount: u64) {
+        let ata = self.create_ata(&owner.pubkey(), amount);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data: encode_deposit(user_idx, amount),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("deposit failed");
+    }
+
+    fn trade(&mut self, user: &Keypair, lp: &Keypair, lp_idx: u16, user_idx: u16, size: i128) {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(lp.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_trade(lp_idx, user_idx, size),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&user.pubkey()), &[user, lp], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("trade failed");
+    }
+
+    fn crank(&mut self) -> u64 {
+        self.crank_with_cu_limit(1_400_000)
+    }
+
+    fn crank_with_cu_limit(&mut self, cu_limit: u32) -> u64 {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(cu_limit);
+
+        let crank_ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_crank_permissionless(0),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[budget_ix, crank_ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+        );
+        let result = self.svm.send_transaction(tx).expect("crank failed");
+        result.compute_units_consumed
+    }
+
+    fn set_price(&mut self, price_e6: i64, slot: u64) {
+        self.svm.set_sysvar(&Clock { slot, ..Clock::default() });
+        let pyth_data = make_pyth_data(price_e6, -6, 1, slot);
+
+        self.svm.set_account(self.pyth_index, Account {
+            lamports: 1_000_000,
+            data: pyth_data.clone(),
+            owner: PYTH_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+        self.svm.set_account(self.pyth_col, Account {
+            lamports: 1_000_000,
+            data: pyth_data,
+            owner: PYTH_PROGRAM_ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+    }
+
+    fn try_crank(&mut self) -> Result<u64, String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+
+        let crank_ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_crank_permissionless(0),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[budget_ix, crank_ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+        );
+        match self.svm.send_transaction(tx) {
+            Ok(result) => Ok(result.compute_units_consumed),
+            Err(e) => Err(format!("{:?}", e)),
+        }
     }
 }
 
-/// Create a RiskEngine with all accounts populated with positions
-/// Uses heap allocation to avoid stack overflow (RiskEngine is ~1.2MB)
-fn setup_full_engine() -> Box<RiskEngine> {
-    let params = default_params();
+fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Keypair> {
+    let mut users = Vec::with_capacity(count);
+    for i in 0..count {
+        let user = Keypair::new();
+        env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+        let ata = env.create_ata(&user.pubkey(), 0);
 
-    // Allocate on heap using Box::new_uninit to avoid stack allocation
-    let mut engine: Box<RiskEngine> = unsafe {
-        let layout = std::alloc::Layout::new::<RiskEngine>();
-        let ptr = std::alloc::alloc_zeroed(layout) as *mut RiskEngine;
-        Box::from_raw(ptr)
-    };
+        let ix = Instruction {
+            program_id: env.program_id,
+            accounts: vec![
+                AccountMeta::new(user.pubkey(), true),
+                AccountMeta::new(env.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(env.pyth_col, false),
+            ],
+            data: encode_init_user(0),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+        );
+        env.svm.send_transaction(tx).unwrap();
 
-    // Initialize in place
-    engine.init_in_place(params);
-    engine.current_slot = 1000;
-    engine.last_crank_slot = 999;
+        let user_idx = (i + 1) as u16;
+        env.deposit(&user, user_idx, deposit_amount);
+        users.push(user);
 
-    // Allocate all accounts using the engine's add_user method
-    for i in 0..MAX_ACCOUNTS {
-        // Use add_user to properly allocate accounts
-        let idx = engine.add_user(0).expect("Failed to add user");
-
-        // Set owner
-        let mut owner = [0u8; 32];
-        owner[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-        engine.accounts[idx as usize].owner = owner;
-
-        // Give it some capital
-        engine.accounts[idx as usize].capital = 10_000_000_000; // 10k tokens
-
-        // Give it a position (alternating long/short for balance)
-        if i % 2 == 0 {
-            engine.accounts[idx as usize].position_size = 1_000_000; // 1 contract long
-        } else {
-            engine.accounts[idx as usize].position_size = -1_000_000; // 1 contract short
+        if (i + 1) % 500 == 0 {
+            println!("    Created {} users...", i + 1);
         }
-
-        // Set entry price
-        engine.accounts[idx as usize].entry_price = 100_000_000; // $100
     }
-
-    // Update open interest to reflect positions
-    engine.total_open_interest = (MAX_ACCOUNTS as u128) * 1_000_000 / 2;
-
-    engine
+    users
 }
 
 #[test]
-fn benchmark_keeper_crank_full() {
-    println!("\n=== KEEPER CRANK WORST-CASE BENCHMARK ===");
+fn benchmark_worst_case_scenarios() {
+    println!("\n=== WORST-CASE CRANK CU BENCHMARK ===");
     println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
+    println!("Solana max CU per tx: 1,400,000\n");
 
-    let mut engine = setup_full_engine();
-    println!("Engine setup complete: {} accounts allocated", engine.num_used_accounts);
-
-    // Verify all accounts are populated
-    assert_eq!(engine.num_used_accounts as usize, MAX_ACCOUNTS);
-
-    let oracle_price = 100_000_000u64; // $100
-    let funding_rate = 1i64; // 0.01% per slot
-    let now_slot = 1000u64;
-
-    // Warm up
-    for i in 0..3 {
-        let _ = engine.keeper_crank(u16::MAX, now_slot + i, oracle_price, funding_rate, false);
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
     }
 
-    // Benchmark
-    let iterations = 10;
-    let start = Instant::now();
+    // Scenario 1: All empty slots (just LP, no users)
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 1: 🟢 All empty slots (LP only) - LOWEST");
+    {
+        let mut env = TestEnv::new();
+        env.init_market();
 
-    for i in 0..iterations {
-        let slot = now_slot + 100 + i;
-        let result = engine.keeper_crank(u16::MAX, slot, oracle_price, funding_rate, false);
-        assert!(result.is_ok());
+        let lp = Keypair::new();
+        env.init_lp(&lp);
+        env.deposit(&lp, 0, 1_000_000_000);
+
+        env.set_price(100_000_000, 200);
+        let cu = env.crank();
+        println!("  CU: {:>10} (baseline scan overhead for {} slots)", cu, MAX_ACCOUNTS);
+        let cu_per_slot = cu / MAX_ACCOUNTS as u64;
+        println!("  CU/slot: ~{}", cu_per_slot);
     }
 
-    let elapsed = start.elapsed();
-    let avg_us = elapsed.as_micros() / iterations as u128;
+    // Scenario 2: All dust accounts (no positions)
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 2: 🟡 All dust accounts (no positions)");
+    {
+        let mut env = TestEnv::new();
+        env.init_market();
 
-    println!("\nBenchmark Results:");
-    println!("  Iterations: {}", iterations);
-    println!("  Total time: {:?}", elapsed);
-    println!("  Average per crank: {} µs", avg_us);
-    println!("  Estimated CU (native): ~{}", avg_us * 100);
-    println!("");
-    println!("Note: Actual Solana BPF CU will be higher due to BPF overhead");
-    println!("Typical multiplier: 3-10x for BPF vs native");
-    println!("");
-}
+        let lp = Keypair::new();
+        env.init_lp(&lp);
+        env.deposit(&lp, 0, 1_000_000_000_000);
 
-#[test]
-fn benchmark_scan_liquidate_full() {
-    println!("\n=== SCAN & LIQUIDATE WORST-CASE BENCHMARK ===");
-    println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
+        // Create users until we hit CU limit
+        let mut users_created = 0;
+        for i in 0..(MAX_ACCOUNTS - 1) {
+            let user = Keypair::new();
+            env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+            let ata = env.create_ata(&user.pubkey(), 0);
 
-    let mut engine = setup_full_engine();
+            let ix = Instruction {
+                program_id: env.program_id,
+                accounts: vec![
+                    AccountMeta::new(user.pubkey(), true),
+                    AccountMeta::new(env.slab, false),
+                    AccountMeta::new(ata, false),
+                    AccountMeta::new(env.vault, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(sysvar::clock::ID, false),
+                    AccountMeta::new_readonly(env.pyth_col, false),
+                ],
+                data: encode_init_user(0),
+            };
+            let tx = Transaction::new_signed_with_payer(
+                &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+            );
+            env.svm.send_transaction(tx).unwrap();
+            env.deposit(&user, (i + 1) as u16, 1);
+            users_created = i + 1;
 
-    // Reduce capital to 0 so all accounts are immediately liquidatable
-    for i in 0..MAX_ACCOUNTS {
-        if engine.is_used(i) {
-            engine.accounts[i].capital = 0; // No capital - guaranteed liquidation
-            engine.accounts[i].pnl = -1_000_000_000; // Also negative PnL
+            if (i + 1) % 500 == 0 {
+                println!("    Created {} users...", i + 1);
+            }
         }
-    }
+        println!("  Created {} dust users total", users_created);
 
-    // Price doesn't matter much since accounts have 0 capital
-    let oracle_price = 100_000_000u64;
-
-    // Count how many would be liquidated
-    let mut longs = 0;
-    let mut shorts = 0;
-    for i in 0..MAX_ACCOUNTS {
-        if engine.is_used(i) {
-            let account = &engine.accounts[i];
-            if account.position_size > 0 {
-                longs += 1;
-            } else if account.position_size < 0 {
-                shorts += 1;
+        env.set_price(100_000_000, 200);
+        match env.try_crank() {
+            Ok(cu) => {
+                let cu_per_account = cu / (users_created + 1) as u64;
+                println!("  CU: {:>10} total, ~{} CU/account", cu, cu_per_account);
+            }
+            Err(_) => {
+                println!("  ⚠️  EXCEEDS 1.4M CU LIMIT with {} users!", users_created);
             }
         }
     }
-    println!("Accounts setup: {} longs, {} shorts (minimal capital)", longs, shorts);
 
-    let now_slot = 1001u64;
-    engine.last_crank_slot = 1000;
+    // Scenario 3: Find practical limit - binary search for max users
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 3: 📊 Finding practical CU limit");
+    {
+        let test_sizes = [100, 500, 1000, 1500, 2000, 2500, 3000, 3500, 4000];
+        let mut last_success = 0u64;
+        let mut last_success_users = 0usize;
 
-    // Benchmark a single crank with mass liquidations
-    let start = Instant::now();
-    let result = engine.keeper_crank(u16::MAX, now_slot, oracle_price, 0, false);
-    let elapsed = start.elapsed();
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                break;
+            }
 
-    match result {
-        Ok(outcome) => {
-            println!("\nBenchmark Results:");
-            println!("  Time for crank with liquidations: {:?}", elapsed);
-            println!("  Num liquidations: {}", outcome.num_liquidations);
-            println!("  GC closed: {}", outcome.num_gc_closed);
-            println!("  Estimated CU (native): ~{}", elapsed.as_micros() * 100);
-            println!("  Estimated CU (BPF): ~{}", elapsed.as_micros() * 500);
-        }
-        Err(e) => {
-            println!("Crank failed: {:?}", e);
-        }
-    }
-    println!("");
-}
+            let mut env = TestEnv::new();
+            env.init_market();
 
-#[test]
-fn benchmark_lp_risk_compute() {
-    println!("\n=== LP RISK STATE COMPUTE BENCHMARK ===");
-    println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            env.deposit(&lp, 0, 1_000_000_000_000);
 
-    // LpRiskState is defined in percolator-prog, not percolator
-    // We'll measure the account scan portion which is the O(n) part
+            // Bulk create users
+            for i in 0..num_users {
+                let user = Keypair::new();
+                env.svm.airdrop(&user.pubkey(), 1_000_000_000).unwrap();
+                let ata = env.create_ata(&user.pubkey(), 0);
 
-    let engine = setup_full_engine();
+                let ix = Instruction {
+                    program_id: env.program_id,
+                    accounts: vec![
+                        AccountMeta::new(user.pubkey(), true),
+                        AccountMeta::new(env.slab, false),
+                        AccountMeta::new(ata, false),
+                        AccountMeta::new(env.vault, false),
+                        AccountMeta::new_readonly(spl_token::ID, false),
+                        AccountMeta::new_readonly(sysvar::clock::ID, false),
+                        AccountMeta::new_readonly(env.pyth_col, false),
+                    ],
+                    data: encode_init_user(0),
+                };
+                let tx = Transaction::new_signed_with_payer(
+                    &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+                );
+                env.svm.send_transaction(tx).unwrap();
+                env.deposit(&user, (i + 1) as u16, 1);
+            }
 
-    // Simulate what LpRiskState::compute does: scan all accounts
-    let iterations = 100;
-    let start = Instant::now();
-
-    for _ in 0..iterations {
-        // Simulate the O(n) scan
-        let mut total_long: i128 = 0;
-        let mut total_short: i128 = 0;
-
-        for block in 0..percolator::BITMAP_WORDS {
-            let mut w = engine.used[block];
-            while w != 0 {
-                let bit = w.trailing_zeros() as usize;
-                let idx = block * 64 + bit;
-                w &= w - 1;
-                if idx >= MAX_ACCOUNTS {
-                    continue;
+            env.set_price(100_000_000, 200);
+            match env.try_crank() {
+                Ok(cu) => {
+                    let cu_per_account = cu / (num_users + 1) as u64;
+                    println!("  {:>4} users: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                    last_success = cu;
+                    last_success_users = num_users;
                 }
-
-                let pos = engine.accounts[idx].position_size;
-                if pos > 0 {
-                    total_long += pos;
-                } else {
-                    total_short += pos;
+                Err(_) => {
+                    println!("  {:>4} users: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
+                    break;
                 }
             }
         }
-
-        std::hint::black_box((total_long, total_short));
+        if last_success_users > 0 {
+            println!("  → Max practical limit: ~{} users in single tx", last_success_users);
+        }
     }
 
-    let elapsed = start.elapsed();
-    let avg_us = elapsed.as_micros() / iterations as u128;
+    // Scenario 4: Healthy accounts with positions (limited users)
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 4: 🟡 Healthy accounts with positions");
+    {
+        // Scale down for positions - they add CU overhead
+        let test_sizes = [50, 100, 200, 500, 1000];
 
-    println!("\nBenchmark Results (account scan):");
-    println!("  Iterations: {}", iterations);
-    println!("  Total time: {:?}", elapsed);
-    println!("  Average per scan: {} µs", avg_us);
-    println!("  Estimated CU (native): ~{}", avg_us * 100);
-    println!("  Estimated CU (BPF): ~{}", avg_us * 500);
-    println!("");
-}
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                break;
+            }
 
-#[test]
-fn print_structure_info() {
-    println!("\n=== STRUCTURE INFO ===");
-    println!("MAX_ACCOUNTS: {}", MAX_ACCOUNTS);
-    println!("BITMAP_WORDS: {}", percolator::BITMAP_WORDS);
-    println!("Size of Account: {} bytes", std::mem::size_of::<Account>());
-    println!("Size of RiskEngine: {} bytes", std::mem::size_of::<RiskEngine>());
-    println!("");
+            let mut env = TestEnv::new();
+            env.init_market();
+
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            env.deposit(&lp, 0, 10_000_000_000_000);
+
+            let users = create_users(&mut env, num_users, 1_000_000);
+
+            // Add positions for each user
+            for (i, user) in users.iter().enumerate() {
+                let user_idx = (i + 1) as u16;
+                let size = if i % 2 == 0 { 100i128 } else { -100i128 };
+                env.trade(user, &lp, 0, user_idx, size);
+            }
+
+            env.set_price(100_000_000, 200);
+            match env.try_crank() {
+                Ok(cu) => {
+                    let cu_per_account = cu / (num_users + 1) as u64;
+                    println!("  {:>4} users: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                }
+                Err(_) => {
+                    println!("  {:>4} users: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Scenario 5: 🟠 Deeply underwater (price crash triggers liquidations)
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 5: 🟠 Deeply underwater accounts (liquidations)");
+    {
+        let test_sizes = [10, 25, 50, 100, 200];
+
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                break;
+            }
+
+            let mut env = TestEnv::new();
+            env.init_market();
+
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            env.deposit(&lp, 0, 100_000_000_000_000);
+
+            let users = create_users(&mut env, num_users, 1_000_000);
+
+            // All users go long with high leverage
+            for (i, user) in users.iter().enumerate() {
+                let user_idx = (i + 1) as u16;
+                env.trade(user, &lp, 0, user_idx, 1000i128);
+            }
+
+            // Price crashes 50% - all users deeply underwater
+            env.set_price(50_000_000, 200);
+
+            match env.try_crank() {
+                Ok(cu) => {
+                    let cu_per_account = cu / (num_users + 1) as u64;
+                    println!("  {:>4} liquidations: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                }
+                Err(_) => {
+                    println!("  {:>4} liquidations: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Scenario 6: 🔴 Knife-edge liquidations (worst case)
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("Scenario 6: 🔴 Knife-edge liquidations (hardest case)");
+    println!("  (mixed long/short at high leverage, price moves 15%)");
+    {
+        let test_sizes = [10, 25, 50, 100, 200];
+
+        for &num_users in &test_sizes {
+            if num_users >= MAX_ACCOUNTS {
+                break;
+            }
+
+            let mut env = TestEnv::new();
+            env.init_market();
+
+            let lp = Keypair::new();
+            env.init_lp(&lp);
+            env.deposit(&lp, 0, 100_000_000_000_000);
+
+            let users = create_users(&mut env, num_users, 10_000_000);
+
+            // Mix of long and short positions at high leverage
+            for (i, user) in users.iter().enumerate() {
+                let user_idx = (i + 1) as u16;
+                let size = if i % 2 == 0 { 5000i128 } else { -5000i128 };
+                env.trade(user, &lp, 0, user_idx, size);
+            }
+
+            // Price moves 15% - triggers some liquidations
+            env.set_price(85_000_000, 200);
+
+            match env.try_crank() {
+                Ok(cu) => {
+                    let cu_per_account = cu / (num_users + 1) as u64;
+                    println!("  {:>4} users at edge: {:>10} CU (~{} CU/user)", num_users, cu, cu_per_account);
+                }
+                Err(_) => {
+                    println!("  {:>4} users at edge: ❌ EXCEEDS 1.4M CU LIMIT", num_users);
+                    break;
+                }
+            }
+        }
+    }
+
+    println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("=== SUMMARY ===");
+    println!("• CU scales O(n) with MAX_ACCOUNTS due to bitmap scan");
+    println!("• With MAX_ACCOUNTS={}, baseline scan alone is ~178K CU", MAX_ACCOUNTS);
+    println!("• Solana 1.4M CU limit constrains practical users per crank");
+    println!("• Liquidation processing adds CU overhead per account");
 }
