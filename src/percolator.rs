@@ -1663,7 +1663,7 @@ pub mod processor {
                 state::write_last_thr_update_slot(&mut data, 0);
             },
             Instruction::InitUser { fee_payment } => {
-                accounts::expect_len(accounts, 7)?;
+                accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
@@ -1692,7 +1692,7 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
             },
             Instruction::InitLP { matcher_program, matcher_context, fee_payment } => {
-                accounts::expect_len(accounts, 7)?;
+                accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
@@ -2487,6 +2487,8 @@ mod tests {
     fn make_pyth(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
         let mut data = vec![0u8; 208];
         data[20..24].copy_from_slice(&expo.to_le_bytes());
+        // Set status = 1 (TRADING) at offset 136
+        data[136..140].copy_from_slice(&1u32.to_le_bytes());
         data[176..184].copy_from_slice(&price.to_le_bytes());
         data[184..192].copy_from_slice(&conf.to_le_bytes());
         data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
@@ -2724,7 +2726,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info(),
             ];
             process_instruction(&f.program_id, &accounts, &data).unwrap();
         }
@@ -2753,7 +2754,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
         }
@@ -2820,7 +2820,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
         }
@@ -2839,7 +2838,6 @@ mod tests {
             let matcher_ctx_key = d2.key;
             let accs = vec![
                 lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                d1.to_info(), d2.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
         }
@@ -2851,7 +2849,7 @@ mod tests {
 
         {
             let accounts = vec![
-                user.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+                user.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_trade(lp_idx, user_idx, 100)).unwrap();
         }
@@ -2875,7 +2873,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
         }
@@ -2927,7 +2924,6 @@ mod tests {
         {
             let accs = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
         }
@@ -2935,14 +2931,13 @@ mod tests {
 
         let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
         let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 1000)).writable();
-        let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
-        let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
         {
             let matcher_prog_key = d1.key;
             let matcher_ctx_key = d2.key;
             let accs = vec![
                 lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                d1.to_info(), d2.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
         }
@@ -2991,7 +2986,6 @@ mod tests {
         {
             let accs = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
         }
@@ -3008,7 +3002,6 @@ mod tests {
             let matcher_ctx_key = matcher_ctx.key;
             let accs = vec![
                 lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                matcher_program.to_info(), matcher_ctx.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
         }
@@ -3049,7 +3042,6 @@ mod tests {
         {
             let accs = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
         }
@@ -3066,7 +3058,6 @@ mod tests {
             let matcher_ctx_key = matcher_ctx.key;
             let accs = vec![
                 lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                matcher_program.to_info(), matcher_ctx.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
         }
@@ -3116,7 +3107,6 @@ mod tests {
         {
             let accs = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
         }
@@ -3133,7 +3123,6 @@ mod tests {
             let matcher_ctx_key = matcher_ctx.key;
             let accs = vec![
                 lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                matcher_program.to_info(), matcher_ctx.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
         }
@@ -3261,7 +3250,6 @@ mod tests {
         {
             let accs = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
         }
@@ -3277,7 +3265,6 @@ mod tests {
             let matcher_ctx_key = d2.key;
             let accs = vec![
                 lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                d1.to_info(), d2.to_info(),
             ];
             process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
         }
@@ -3297,7 +3284,7 @@ mod tests {
         let trade_size: i128 = 100_000;
         {
             let accs = vec![
-                user.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+                user.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()
             ];
             process_instruction(&f.program_id, &accs, &encode_trade(lp_idx, user_idx, trade_size)).unwrap();
         }
@@ -3439,7 +3426,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_init_user(100)).unwrap();
         }
@@ -3533,7 +3519,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_init_user(100)).unwrap();
         }
@@ -3541,7 +3526,6 @@ mod tests {
         {
             let accounts = vec![
                 user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
-                f.clock.to_info(), f.pyth_col.to_info()
             ];
             process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 100_000)).unwrap();
         }
