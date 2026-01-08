@@ -65,9 +65,31 @@ fn make_token_account_data(mint: &Pubkey, owner: &Pubkey, amount: u64) -> Vec<u8
     data
 }
 
+fn make_mint_data() -> Vec<u8> {
+    use spl_token::state::Mint;
+    let mut data = vec![0u8; Mint::LEN];
+    let mint = Mint {
+        mint_authority: solana_sdk::program_option::COption::None,
+        supply: 0,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: solana_sdk::program_option::COption::None,
+    };
+    Mint::pack(mint, &mut data).unwrap();
+    data
+}
+
 fn make_pyth_data(price: i64, expo: i32, conf: u64, pub_slot: u64) -> Vec<u8> {
     let mut data = vec![0u8; 208];
+    // Pyth magic: 0xa1b2c3d4
+    data[0..4].copy_from_slice(&0xa1b2c3d4u32.to_le_bytes());
+    // Pyth version: 2
+    data[4..8].copy_from_slice(&2u32.to_le_bytes());
+    // Pyth account type: 3 (Price)
+    data[8..12].copy_from_slice(&3u32.to_le_bytes());
     data[20..24].copy_from_slice(&expo.to_le_bytes());
+    // Status: 1 (Trading)
+    data[136..140].copy_from_slice(&1u32.to_le_bytes());
     data[176..184].copy_from_slice(&price.to_le_bytes());
     data[184..192].copy_from_slice(&conf.to_le_bytes());
     data[200..208].copy_from_slice(&pub_slot.to_le_bytes());
@@ -192,7 +214,7 @@ impl TestEnv {
 
         svm.set_account(mint, Account {
             lamports: 1_000_000,
-            data: vec![0u8; 82],
+            data: make_mint_data(),
             owner: spl_token::ID,
             executable: false,
             rent_epoch: 0,
