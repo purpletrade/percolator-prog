@@ -2715,16 +2715,8 @@ pub mod processor {
                 accounts::expect_signer(a_dest)?;
                 accounts::expect_writable(a_slab)?;
 
-                // With unsafe_close: skip all validation, directly access raw account data
-                // This works even if slab data layout has changed between builds
-                #[cfg(feature = "unsafe_close")]
-                {
-                    let mut data = a_slab.try_borrow_mut_data()?;
-                    for b in data.iter_mut() {
-                        *b = 0;
-                    }
-                }
-
+                // With unsafe_close: skip all validation and zeroing (CU limit)
+                // Account will be garbage collected after lamports are drained
                 #[cfg(not(feature = "unsafe_close"))]
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
