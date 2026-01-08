@@ -541,6 +541,7 @@ fn create_users(env: &mut TestEnv, count: usize, deposit_amount: u64) -> Vec<Key
     users
 }
 
+#[cfg(not(feature = "test"))]
 #[test]
 fn benchmark_worst_case_scenarios() {
     println!("\n=== WORST-CASE CRANK CU BENCHMARK ===");
