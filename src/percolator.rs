@@ -39,6 +39,11 @@ pub mod constants {
     /// Sentinel value for permissionless crank (no caller account required)
     pub const CRANK_NO_CALLER: u16 = u16::MAX;
 
+    /// Maximum allowed unit_scale for InitMarket.
+    /// unit_scale=0 disables scaling (1:1 base tokens to units, dust=0 always).
+    /// unit_scale=1..=1_000_000_000 enables scaling with dust tracking.
+    pub const MAX_UNIT_SCALE: u32 = 1_000_000_000;
+
     // Inventory-mark funding constants (Option 2)
     // Funding is computed on-chain from LP inventory + oracle price
     pub const FUNDING_HORIZON_SLOTS: u64 = 500;            // ~4 min @ ~2 slots/sec
@@ -781,6 +786,19 @@ pub mod verify {
         }
         let s = scale as u64;
         (dust / s, dust % s)
+    }
+
+    // =========================================================================
+    // InitMarket scale validation (pure logic)
+    // =========================================================================
+
+    /// Validate unit_scale for InitMarket instruction.
+    /// Returns true if scale is within allowed bounds.
+    /// scale=0: disables scaling, 1:1 base tokens to units, dust always 0.
+    /// scale=1..=MAX_UNIT_SCALE: enables scaling with dust tracking.
+    #[inline]
+    pub fn init_market_scale_ok(unit_scale: u32) -> bool {
+        unit_scale <= crate::constants::MAX_UNIT_SCALE
     }
 }
 
@@ -1827,10 +1845,7 @@ pub mod processor {
                 }
 
                 // Validate unit_scale: reject huge values that make most deposits credit 0 units
-                // unit_scale=0 disables scaling (1:1 base tokens to units)
-                // unit_scale=1_000_000_000 allows for up to 9 decimal places of precision loss
-                const MAX_UNIT_SCALE: u32 = 1_000_000_000;
-                if unit_scale > MAX_UNIT_SCALE {
+                if !crate::verify::init_market_scale_ok(unit_scale) {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 

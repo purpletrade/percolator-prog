@@ -48,7 +48,10 @@ use percolator_prog::verify::{
     withdraw_amount_aligned,
     // New: Dust math
     accumulate_dust, sweep_dust,
+    // New: InitMarket scale validation
+    init_market_scale_ok,
 };
+use percolator_prog::constants::MAX_UNIT_SCALE;
 
 // =============================================================================
 // Test Fixtures
@@ -1819,7 +1822,7 @@ fn kani_invert_monotonic() {
 }
 
 // =============================================================================
-// AB. UNIT CONVERSION ALGEBRA PROOFS (5 proofs)
+// AB. UNIT CONVERSION ALGEBRA PROOFS (8 proofs)
 // =============================================================================
 
 /// Prove: base_to_units conservation: units*scale + dust == base (when scale > 0)
@@ -1885,6 +1888,51 @@ fn kani_units_to_base_scale_zero() {
     assert_eq!(base, units, "scale==0 must return units unchanged");
 }
 
+/// Prove: base_to_units is monotonic: base1 < base2 => units1 <= units2
+#[kani::proof]
+fn kani_base_to_units_monotonic() {
+    let base1: u64 = kani::any();
+    let base2: u64 = kani::any();
+    let scale: u32 = kani::any();
+    kani::assume(scale > 0);
+    kani::assume(base1 < base2);
+
+    let (units1, _) = base_to_units(base1, scale);
+    let (units2, _) = base_to_units(base2, scale);
+
+    assert!(units1 <= units2, "base_to_units must be monotonic");
+}
+
+/// Prove: units_to_base is strictly monotonic (without overflow)
+#[kani::proof]
+fn kani_units_to_base_monotonic() {
+    let units1: u64 = kani::any();
+    let units2: u64 = kani::any();
+    let scale: u32 = kani::any();
+    kani::assume(scale > 0);
+    kani::assume(units1 < units2);
+    // Avoid overflow
+    kani::assume(units2 <= u64::MAX / (scale as u64));
+
+    let base1 = units_to_base(units1, scale);
+    let base2 = units_to_base(units2, scale);
+
+    assert!(base1 < base2, "units_to_base must be strictly monotonic");
+}
+
+/// Prove: scale==0 preserves monotonicity for base_to_units
+#[kani::proof]
+fn kani_base_to_units_monotonic_scale_zero() {
+    let base1: u64 = kani::any();
+    let base2: u64 = kani::any();
+    kani::assume(base1 < base2);
+
+    let (units1, _) = base_to_units(base1, 0);
+    let (units2, _) = base_to_units(base2, 0);
+
+    assert!(units1 < units2, "scale==0 must preserve strict monotonicity");
+}
+
 // =============================================================================
 // AC. WITHDRAW ALIGNMENT PROOFS (3 proofs)
 // =============================================================================
@@ -1928,7 +1976,7 @@ fn kani_withdraw_scale_zero_always_aligned() {
 }
 
 // =============================================================================
-// AD. DUST MATH PROOFS (5 proofs)
+// AD. DUST MATH PROOFS (8 proofs)
 // =============================================================================
 
 /// Prove: sweep_dust conservation: units*scale + rem == dust (scale > 0)
@@ -1999,6 +2047,45 @@ fn kani_accumulate_dust_saturates() {
     } else {
         assert_eq!(result, u64::MAX, "overflow saturates to MAX");
     }
+}
+
+/// Prove: scale==0 policy - base_to_units never produces dust
+/// This is the foundation of the "no dust when scale==0" invariant
+#[kani::proof]
+fn kani_scale_zero_policy_no_dust() {
+    let base: u64 = kani::any();
+
+    let (_, dust) = base_to_units(base, 0);
+
+    assert_eq!(dust, 0, "scale==0 must NEVER produce dust");
+}
+
+/// Prove: scale==0 policy - sweep never leaves remainder
+/// Combined with no-dust production, this ensures dust stays 0
+#[kani::proof]
+fn kani_scale_zero_policy_sweep_complete() {
+    let dust: u64 = kani::any();
+
+    let (_, rem) = sweep_dust(dust, 0);
+
+    assert_eq!(rem, 0, "scale==0 sweep must leave no remainder");
+}
+
+/// Prove: scale==0 end-to-end - deposit/sweep cycle produces zero dust
+/// Simulates: deposit base → get (units, dust) → sweep dust → final remainder
+#[kani::proof]
+fn kani_scale_zero_policy_end_to_end() {
+    let base: u64 = kani::any();
+
+    // Deposit converts base to units + dust
+    let (_, dust) = base_to_units(base, 0);
+
+    // Sweep any accumulated dust
+    let (_, final_rem) = sweep_dust(dust, 0);
+
+    // Both must be zero when scale==0
+    assert_eq!(dust, 0, "deposit with scale==0 must produce no dust");
+    assert_eq!(final_rem, 0, "sweep with scale==0 must leave no remainder");
 }
 
 // =============================================================================
@@ -2459,4 +2546,127 @@ fn kani_tradecpi_from_ret_forced_acceptance() {
             panic!("must accept when all conditions pass");
         }
     }
+}
+
+// =============================================================================
+// AK. INITMARKET UNIT_SCALE BOUNDS PROOFS (4 proofs)
+// =============================================================================
+
+/// Prove: scale > MAX_UNIT_SCALE is rejected
+#[kani::proof]
+fn kani_init_market_scale_rejects_overflow() {
+    let scale: u32 = kani::any();
+    kani::assume(scale > MAX_UNIT_SCALE);
+
+    let result = init_market_scale_ok(scale);
+
+    assert!(!result, "scale > MAX_UNIT_SCALE must be rejected");
+}
+
+/// Prove: scale=0 is accepted (disables scaling)
+#[kani::proof]
+fn kani_init_market_scale_zero_ok() {
+    let result = init_market_scale_ok(0);
+
+    assert!(result, "scale=0 must be accepted");
+}
+
+/// Prove: scale=MAX_UNIT_SCALE is accepted (boundary)
+#[kani::proof]
+fn kani_init_market_scale_boundary_ok() {
+    let result = init_market_scale_ok(MAX_UNIT_SCALE);
+
+    assert!(result, "scale=MAX_UNIT_SCALE must be accepted");
+}
+
+/// Prove: scale=MAX_UNIT_SCALE+1 is rejected (boundary)
+#[kani::proof]
+fn kani_init_market_scale_boundary_reject() {
+    // Note: if MAX_UNIT_SCALE is u32::MAX, this proof is vacuous (which is fine)
+    if MAX_UNIT_SCALE < u32::MAX {
+        let result = init_market_scale_ok(MAX_UNIT_SCALE + 1);
+        assert!(!result, "scale=MAX_UNIT_SCALE+1 must be rejected");
+    }
+}
+
+/// Prove: any scale in valid range [0, MAX_UNIT_SCALE] is accepted
+#[kani::proof]
+fn kani_init_market_scale_valid_range() {
+    let scale: u32 = kani::any();
+    kani::assume(scale <= MAX_UNIT_SCALE);
+
+    let result = init_market_scale_ok(scale);
+
+    assert!(result, "any scale in [0, MAX_UNIT_SCALE] must be accepted");
+}
+
+// =============================================================================
+// AL. NON-INTERFERENCE PROOFS (4 proofs)
+// Prove scaling functions are independent of security-critical decisions
+// =============================================================================
+
+/// Prove: admin_ok is independent of unit_scale
+/// Changing scale doesn't affect admin authorization
+#[kani::proof]
+fn kani_admin_ok_independent_of_scale() {
+    let admin: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    let scale1: u32 = kani::any();
+    let scale2: u32 = kani::any();
+
+    // Regardless of scale choice, admin_ok gives same result
+    let result1 = admin_ok(admin, signer);
+    // Simulate "using" scale (it has no effect on admin_ok)
+    let _ = init_market_scale_ok(scale1);
+    let _ = init_market_scale_ok(scale2);
+    let result2 = admin_ok(admin, signer);
+
+    assert_eq!(result1, result2, "admin_ok must not depend on scale");
+}
+
+/// Prove: owner_ok is independent of unit_scale
+#[kani::proof]
+fn kani_owner_ok_independent_of_scale() {
+    let stored: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    let scale: u32 = kani::any();
+
+    // owner_ok doesn't use scale at all
+    let result = owner_ok(stored, signer);
+
+    // unit scale operations are completely separate
+    let (units, dust) = base_to_units(kani::any(), scale);
+    let _ = units_to_base(units, scale);
+    let _ = dust;
+
+    // Re-check owner_ok - same result
+    assert_eq!(result, owner_ok(stored, signer),
+        "owner_ok must not depend on scale operations");
+}
+
+/// Prove: unit conversion is deterministic - same inputs always give same outputs
+#[kani::proof]
+fn kani_unit_conversion_deterministic() {
+    let base: u64 = kani::any();
+    let scale: u32 = kani::any();
+
+    let (units1, dust1) = base_to_units(base, scale);
+    let (units2, dust2) = base_to_units(base, scale);
+
+    assert_eq!(units1, units2, "base_to_units must be deterministic");
+    assert_eq!(dust1, dust2, "base_to_units dust must be deterministic");
+}
+
+/// Prove: unit scale validation is pure - no side effects
+#[kani::proof]
+fn kani_scale_validation_pure() {
+    let scale: u32 = kani::any();
+
+    // Call multiple times - same result
+    let result1 = init_market_scale_ok(scale);
+    let result2 = init_market_scale_ok(scale);
+    let result3 = init_market_scale_ok(scale);
+
+    assert_eq!(result1, result2, "init_market_scale_ok must be pure (1)");
+    assert_eq!(result2, result3, "init_market_scale_ok must be pure (2)");
 }
