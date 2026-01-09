@@ -1875,6 +1875,14 @@ pub mod processor {
                 let engine = zc::engine_mut(&mut data)?;
                 engine.init_in_place(risk_params);
 
+                // Initialize slot fields to current slot to prevent overflow on first crank
+                // (accrue_funding checks dt < 31_536_000, which fails if last_funding_slot=0)
+                let a_clock = &accounts[5];
+                let clock = Clock::from_account_info(a_clock)?;
+                engine.current_slot = clock.slot;
+                engine.last_funding_slot = clock.slot;
+                engine.last_crank_slot = clock.slot;
+
                 let config = MarketConfig {
                     collateral_mint: a_mint.key.to_bytes(),
                     vault_pubkey: a_vault.key.to_bytes(),
