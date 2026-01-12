@@ -1758,32 +1758,6 @@ pub mod oracle {
 
         Ok(inverted as u64)
     }
-
-    /// Read the raw oracle price in e6, WITHOUT inversion.
-    /// Used for funding calculation which needs USD-denominated notional.
-    pub fn read_raw_price_e6(
-        price_ai: &AccountInfo,
-        expected_feed_id: &[u8; 32],
-        now_unix_ts: i64,
-        max_staleness_secs: u64,
-        conf_bps: u16,
-    ) -> Result<u64, ProgramError> {
-        // Detect oracle type by account owner and dispatch
-        if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
-            read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)
-        } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
-            read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)
-        } else {
-            #[cfg(feature = "test")]
-            {
-                read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)
-            }
-            #[cfg(not(feature = "test"))]
-            {
-                Err(ProgramError::IllegalOwner)
-            }
-        }
-    }
 }
 
 // 9. mod collateral
@@ -2415,19 +2389,12 @@ pub mod processor {
                 // Engine internally gates same-slot compounding via dt = now_slot - last_funding_slot,
                 // so passing the same rate multiple times in the same slot is harmless (dt=0 => no change).
                 //
-                // IMPORTANT: Use raw (non-inverted) oracle price for funding calculation.
-                // Funding notional must be USD-denominated regardless of market invert setting.
-                let raw_price = oracle::read_raw_price_e6(
-                    a_oracle,
-                    &config.index_feed_id,
-                    clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                )?;
+                // Uses market price (may be inverted). For inverted markets, configure
+                // funding_inv_scale_notional_e6 appropriately at market init to handle precision.
                 let net_lp_pos = crate::compute_net_lp_pos(engine);
                 let effective_funding_rate = crate::compute_inventory_funding_bps_per_slot(
                     net_lp_pos,
-                    raw_price,  // Use raw price, not inverted
+                    price,
                     config.funding_horizon_slots,
                     config.funding_k_bps,
                     config.funding_inv_scale_notional_e6,
