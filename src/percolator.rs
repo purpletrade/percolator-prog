@@ -826,9 +826,14 @@ pub mod zc {
     // Use const to export the actual offset for debugging
     pub const ACCOUNTS_OFFSET: usize = offset_of!(RiskEngine, accounts);
 
+    /// Old slab length (before Account struct reordering migration)
+    /// Old slabs support up to 4095 accounts, new slabs support 4096.
+    const OLD_ENGINE_LEN: usize = ENGINE_LEN - 8;
+
     #[inline]
     pub fn engine_ref<'a>(data: &'a [u8]) -> Result<&'a RiskEngine, ProgramError> {
-        if data.len() < ENGINE_OFF + ENGINE_LEN {
+        // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
+        if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_ptr().add(ENGINE_OFF) };
@@ -840,7 +845,8 @@ pub mod zc {
 
     #[inline]
     pub fn engine_mut<'a>(data: &'a mut [u8]) -> Result<&'a mut RiskEngine, ProgramError> {
-        if data.len() < ENGINE_OFF + ENGINE_LEN {
+        // Accept old slabs (ENGINE_LEN - 8) for backward compatibility
+        if data.len() < ENGINE_OFF + OLD_ENGINE_LEN {
             return Err(ProgramError::InvalidAccountData);
         }
         let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
@@ -1069,6 +1075,8 @@ pub mod ix {
             thresh_max: u128,
             thresh_min_step: u128,
         },
+        /// Set maintenance fee per slot (admin only)
+        SetMaintenanceFee { new_fee: u128 },
     }
 
     impl Instruction {
@@ -1170,6 +1178,10 @@ pub mod ix {
                         thresh_floor, thresh_risk_bps, thresh_update_interval_slots,
                         thresh_step_bps, thresh_alpha_bps, thresh_min, thresh_max, thresh_min_step,
                     })
+                },
+                15 => { // SetMaintenanceFee
+                    let new_fee = read_u128(&mut rest)?;
+                    Ok(Instruction::SetMaintenanceFee { new_fee })
                 },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -1910,9 +1922,12 @@ pub mod processor {
 
     fn slab_guard(program_id: &Pubkey, slab: &AccountInfo, data: &[u8]) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable)
+        // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
+        // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
+        const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -2811,12 +2826,29 @@ pub mod processor {
                     config.unit_scale,
                 )?;
 
+                // Debug logging for liquidation (using sol_log_64 for no_std)
+                sol_log_64(target_idx as u64, price, 0, 0, 0);  // idx, price
+                {
+                    let acc = &engine.accounts[target_idx as usize];
+                    sol_log_64(acc.capital.get() as u64, acc.pnl.get() as u64, 0, 0, 1);  // cap, pnl
+                    sol_log_64(acc.position_size.get() as u64, acc.entry_price, 0, 0, 2);  // pos, entry
+                    // Calculate mark PnL
+                    let pos = acc.position_size.get();
+                    let entry = acc.entry_price as i128;
+                    let mark = pos.saturating_mul(price as i128 - entry) / 1_000_000;
+                    let equity = (acc.capital.get() as i128).saturating_add(acc.pnl.get()).saturating_add(mark);
+                    let notional = (if pos < 0 { -pos } else { pos } as u128).saturating_mul(price as u128) / 1_000_000;
+                    let maint_req = notional.saturating_mul(engine.params.maintenance_margin_bps as u128) / 10_000;
+                    sol_log_64(mark as u64, equity as u64, maint_req as u64, 0, 3);  // mark, equity, maint
+                }
+
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: liquidate_start");
                     sol_log_compute_units();
                 }
                 let _res = engine.liquidate_at_oracle(target_idx, clock.slot, price).map_err(map_risk_error)?;
+                sol_log_64(_res as u64, 0, 0, 0, 4);  // result
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: liquidate_end");
@@ -3069,6 +3101,25 @@ pub mod processor {
                 config.thresh_max = thresh_max;
                 config.thresh_min_step = thresh_min_step;
                 state::write_config(&mut data, &config);
+            }
+
+            Instruction::SetMaintenanceFee { new_fee } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let engine = zc::engine_mut(&mut data)?;
+                engine.params.maintenance_fee_per_slot = percolator::U128::new(new_fee);
             }
         }
         Ok(())
