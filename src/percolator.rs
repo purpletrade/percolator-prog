@@ -1077,6 +1077,13 @@ pub mod ix {
         },
         /// Set maintenance fee per slot (admin only)
         SetMaintenanceFee { new_fee: u128 },
+        /// Set the oracle price authority (admin only).
+        /// Authority can push prices instead of requiring Pyth/Chainlink.
+        /// Pass zero pubkey to disable and require Pyth/Chainlink.
+        SetOracleAuthority { new_authority: Pubkey },
+        /// Push oracle price (oracle authority only).
+        /// Stores the price for use by crank/trade operations.
+        PushOraclePrice { price_e6: u64, timestamp: i64 },
     }
 
     impl Instruction {
@@ -1182,6 +1189,15 @@ pub mod ix {
                 15 => { // SetMaintenanceFee
                     let new_fee = read_u128(&mut rest)?;
                     Ok(Instruction::SetMaintenanceFee { new_fee })
+                },
+                16 => { // SetOracleAuthority
+                    let new_authority = read_pubkey(&mut rest)?;
+                    Ok(Instruction::SetOracleAuthority { new_authority })
+                },
+                17 => { // PushOraclePrice
+                    let price_e6 = read_u64(&mut rest)?;
+                    let timestamp = read_i64(&mut rest)?;
+                    Ok(Instruction::PushOraclePrice { price_e6, timestamp })
                 },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -1394,6 +1410,17 @@ pub mod state {
         pub thresh_max: u128,
         /// Minimum step size
         pub thresh_min_step: u128,
+
+        // ========================================
+        // Oracle Authority (optional signer-based oracle)
+        // ========================================
+        /// Oracle price authority pubkey. If non-zero, this signer can push prices
+        /// directly instead of requiring Pyth/Chainlink. All zeros = disabled.
+        pub oracle_authority: [u8; 32],
+        /// Last price pushed by oracle authority (in e6 format, already scaled)
+        pub authority_price_e6: u64,
+        /// Unix timestamp when authority last pushed the price
+        pub authority_timestamp: i64,
     }
 
     pub fn slab_data_mut<'a, 'b>(ai: &'b AccountInfo<'a>) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
@@ -1786,6 +1813,61 @@ pub mod oracle {
         crate::verify::scale_price_e6(price_after_invert, unit_scale)
             .ok_or(PercolatorError::OracleInvalid.into())
     }
+
+    /// Check if authority-pushed price is available and fresh.
+    /// Returns Some(price_e6) if authority is set and price is within staleness bounds.
+    /// Returns None if no authority is set or price is stale.
+    ///
+    /// Note: The stored authority_price_e6 is already in the correct format (e6, scaled).
+    pub fn read_authority_price(
+        config: &super::state::MarketConfig,
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+    ) -> Option<u64> {
+        // No authority set
+        if config.oracle_authority == [0u8; 32] {
+            return None;
+        }
+        // No price pushed yet
+        if config.authority_price_e6 == 0 {
+            return None;
+        }
+        // Check staleness
+        let age = now_unix_ts.saturating_sub(config.authority_timestamp);
+        if age < 0 || age as u64 > max_staleness_secs {
+            return None;
+        }
+        Some(config.authority_price_e6)
+    }
+
+    /// Read oracle price, preferring authority-pushed price over Pyth/Chainlink.
+    ///
+    /// If an oracle authority is configured and has pushed a fresh price, use that.
+    /// Otherwise, fall back to reading from the provided Pyth/Chainlink account.
+    ///
+    /// The price_ai can be any account when using authority oracle - it won't be read
+    /// if the authority price is valid.
+    pub fn read_price_with_authority(
+        config: &super::state::MarketConfig,
+        price_ai: &AccountInfo,
+        now_unix_ts: i64,
+    ) -> Result<u64, ProgramError> {
+        // Try authority price first
+        if let Some(authority_price) = read_authority_price(config, now_unix_ts, config.max_staleness_secs) {
+            return Ok(authority_price);
+        }
+
+        // Fall back to Pyth/Chainlink
+        read_engine_price_e6(
+            price_ai,
+            &config.index_feed_id,
+            now_unix_ts,
+            config.max_staleness_secs,
+            config.conf_filter_bps,
+            config.invert,
+            config.unit_scale,
+        )
+    }
 }
 
 // 9. mod collateral
@@ -2138,6 +2220,10 @@ pub mod processor {
                     thresh_min: DEFAULT_THRESH_MIN,
                     thresh_max: DEFAULT_THRESH_MAX,
                     thresh_min_step: DEFAULT_THRESH_MIN_STEP,
+                    // Oracle authority (disabled by default - use Pyth/Chainlink)
+                    oracle_authority: [0u8; 32],
+                    authority_price_e6: 0,
+                    authority_timestamp: 0,
                 };
                 state::write_config(&mut data, &config);
 
@@ -2312,15 +2398,11 @@ pub mod processor {
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Read oracle price (feed_id validation done inside)
-                let price = oracle::read_engine_price_e6(
+                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
+                let price = oracle::read_price_with_authority(
+                    &config,
                     a_oracle_idx,
-                    &config.index_feed_id,
                     clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                    config.invert,
-                    config.unit_scale,
                 )?;
 
                 // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
@@ -2407,15 +2489,11 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Read oracle price (feed_id validation done inside)
-                let price = oracle::read_engine_price_e6(
+                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
+                let price = oracle::read_price_with_authority(
+                    &config,
                     a_oracle,
-                    &config.index_feed_id,
                     clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                    config.invert,
-                    config.unit_scale,
                 )?;
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
@@ -2550,16 +2628,11 @@ pub mod processor {
                 let clock = Clock::from_account_info(&accounts[3])?;
                 let a_oracle = &accounts[4];
 
-                // Read oracle price (feed_id validation done inside)
-                // SECURITY: Prevents oracle substitution attacks via feed_id check
-                let price = oracle::read_engine_price_e6(
+                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
+                let price = oracle::read_price_with_authority(
+                    &config,
                     a_oracle,
-                    &config.index_feed_id,
                     clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                    config.invert,
-                    config.unit_scale,
                 )?;
 
                 // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
@@ -2690,15 +2763,11 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Use engine price (with inversion and unit scaling if configured)
-                let price = oracle::read_engine_price_e6(
+                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
+                let price = oracle::read_price_with_authority(
+                    &config,
                     a_oracle,
-                    &config.index_feed_id,
                     clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                    config.invert,
-                    config.unit_scale,
                 )?;
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -2818,15 +2887,11 @@ pub mod processor {
                 check_idx(engine, target_idx)?;
 
                 let clock = Clock::from_account_info(&accounts[2])?;
-                // Use engine price (with inversion and unit scaling if configured)
-                let price = oracle::read_engine_price_e6(
+                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
+                let price = oracle::read_price_with_authority(
+                    &config,
                     a_oracle,
-                    &config.index_feed_id,
                     clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                    config.invert,
-                    config.unit_scale,
                 )?;
 
                 // Debug logging for liquidation (using sol_log_64 for no_std)
@@ -2894,15 +2959,11 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(&accounts[6])?;
-                // Use engine price (with inversion and unit scaling if configured)
-                let price = oracle::read_engine_price_e6(
+                // Read oracle price (prefers authority price if set, falls back to Pyth/Chainlink)
+                let price = oracle::read_price_with_authority(
+                    &config,
                     a_oracle,
-                    &config.index_feed_id,
                     clock.unix_timestamp,
-                    config.max_staleness_secs,
-                    config.conf_filter_bps,
-                    config.invert,
-                    config.unit_scale,
                 )?;
 
                 #[cfg(feature = "cu-audit")]
@@ -3123,6 +3184,62 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
                 engine.params.maintenance_fee_per_slot = percolator::U128::new(new_fee);
+            }
+
+            Instruction::SetOracleAuthority { new_authority } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Update oracle authority in config
+                let mut config = state::read_config(&data);
+                config.oracle_authority = new_authority.to_bytes();
+                // Clear stored price when authority changes
+                config.authority_price_e6 = 0;
+                config.authority_timestamp = 0;
+                state::write_config(&mut data, &config);
+            }
+
+            Instruction::PushOraclePrice { price_e6, timestamp } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_authority = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_authority)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                // Verify caller is the oracle authority
+                let mut config = state::read_config(&data);
+                if config.oracle_authority == [0u8; 32] {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+                if config.oracle_authority != a_authority.key.to_bytes() {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // Validate price (must be positive)
+                if price_e6 == 0 {
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
+
+                // Store the new price
+                config.authority_price_e6 = price_e6;
+                config.authority_timestamp = timestamp;
+                state::write_config(&mut data, &config);
             }
         }
         Ok(())
