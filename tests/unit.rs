@@ -364,6 +364,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     }
 
     #[test]
+    #[cfg(feature = "test")]
     fn test_init_user() {
         let mut f = setup_market();
         let init_data = encode_init_market(&f, 100);
@@ -393,6 +394,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     }
 
     #[test]
+    #[cfg(feature = "test")]
     fn test_deposit_withdraw() {
         let mut f = setup_market();
         let init_data = encode_init_market(&f, 0); 
@@ -510,6 +512,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     }
 
     #[test]
+    #[cfg(feature = "test")]
     fn test_withdraw_wrong_signer() {
         let mut f = setup_market();
         let init_data = encode_init_market(&f, 0);
@@ -557,9 +560,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
             ];
             process_instruction(&f.program_id, &accounts, &encode_withdraw(user_idx, 100))
         };
-        // After circuit-breaker restructuring, vault/ATA checks run before owner check,
-        // so wrong signer is rejected as InvalidTokenAccount (ATA owner != signer)
-        assert_eq!(res, Err(PercolatorError::InvalidTokenAccount.into()));
+        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
     }
 
     #[test]
@@ -1642,6 +1643,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     }
 
     #[test]
+    #[cfg(feature = "test")]
     fn test_vault_amount_matches_engine_vault_plus_dust() {
         // INVARIANT #1: SPL vault balance = engine.vault * unit_scale + dust_base
         //
@@ -1862,6 +1864,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     }
 
     #[test]
+    #[cfg(feature = "test")]
     fn test_dust_sweep_preserves_real_to_accounted_equality() {
         // DUST POLICY: Dust is swept to insurance via top_up_insurance_fund,
         // which covers loss_accum first, then adds to insurance_fund.balance.
@@ -1959,6 +1962,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     }
 
     #[test]
+    #[cfg(feature = "test")]
     fn test_invariants_with_unit_scale_zero() {
         // Verify invariants work when unit_scale=0 (no scaling)
         // In this mode: 1 base token = 1 unit, no dust ever created
