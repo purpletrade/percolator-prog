@@ -28,7 +28,7 @@ use std::path::PathBuf;
 // Note: We use production BPF (not test feature) because test feature
 // bypasses CPI for token transfers, which fails in LiteSVM.
 // Haircut-ratio engine (ADL/socialization scratch arrays removed)
-const SLAB_LEN: usize = 1025336;  // MAX_ACCOUNTS=4096 + oracle circuit breaker
+const SLAB_LEN: usize = 992560;  // MAX_ACCOUNTS=4096 + oracle circuit breaker (no padding)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID
@@ -990,4 +990,75 @@ fn test_bug7_pending_epoch_wraparound() {
 
     // Note: Full test would require running 256+ cranks which is expensive
     // The bug is evident from code inspection
+}
+
+// ============================================================================
+// Finding L: Margin check uses maintenance instead of initial margin
+// ============================================================================
+
+/// Test that execute_trade() incorrectly uses maintenance_margin_bps instead of
+/// initial_margin_bps, allowing users to open positions at 2x intended leverage.
+///
+/// Finding L from security audit:
+/// - maintenance_margin_bps = 500 (5%)
+/// - initial_margin_bps = 1000 (10%)
+/// - Bug: Trade opening checks 5% margin instead of 10%
+/// - Result: Users can open at ~20x leverage instead of max 10x
+#[test]
+fn test_bug_finding_l_margin_check_uses_maintenance_instead_of_initial() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    // Finding L: execute_trade() uses maintenance_margin_bps (5%) instead of
+    // initial_margin_bps (10%), allowing 2x intended leverage.
+    //
+    // RiskParams in encode_init_market:
+    //   maintenance_margin_bps = 500 (5%)
+    //   initial_margin_bps = 1000 (10%)
+    //
+    // Test: deposit enough to pass maintenance but fail initial margin check.
+    // BUG: trade succeeds when it should be rejected.
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(1);
+
+    // Create LP with sufficient capital
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    // Create user with capital between maintenance and initial margin requirements
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    // For 10 SOL notional at $138 price:
+    //   Maintenance margin (5%) = 0.5 SOL
+    //   Initial margin (10%) = 1.0 SOL
+    // Deposit 0.6 SOL (above maint, below initial)
+    env.deposit(&user, user_idx, 600_000_000); // 0.6 SOL
+
+    // Calculate position size for ~10 SOL notional
+    // size * price / 1_000_000 = notional
+    // size = notional * 1_000_000 / price = 10_000_000_000 * 1_000_000 / 138_000_000
+    let size: i128 = 72_463_768; // ~10 SOL notional at $138
+
+    // BUG: This trade should be REJECTED (equity 0.6 < initial margin 1.0)
+    // But it is ACCEPTED (equity 0.6 > maintenance margin 0.5)
+    let result = env.try_trade(&user, &lp, lp_idx, user_idx, size);
+
+    assert!(
+        result.is_ok(),
+        "FINDING L REPRODUCED: Trade at ~16.7x leverage accepted. \
+         Should require 10% initial margin but only checks 5% maintenance. \
+         Expected: Ok (bug), Got: {:?}", result
+    );
+
+    println!("FINDING L CONFIRMED: execute_trade() checks maintenance_margin_bps (5%)");
+    println!("instead of initial_margin_bps (10%). User opened position at ~16.7x leverage.");
+    println!("Position notional: ~10 SOL, Equity: 0.6 SOL");
+    println!("Maintenance margin required: 0.5 SOL (passes)");
+    println!("Initial margin required: 1.0 SOL (should fail but doesn't)");
 }
