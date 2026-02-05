@@ -2731,3 +2731,110 @@ The Percolator protocol demonstrates **production-ready security** with:
 - Extensive test suite
 
 **No exploitable vulnerabilities identified in well-configured markets.**
+
+---
+
+## Session 14 (2026-02-05 - Novel Attack Vector Research)
+
+### Combination Attack Hypotheses Tested
+
+#### 191. Haircut + Warmup Race Condition ✓
+**Hypothesis**: Can account processing order during crank affect haircut distribution?
+**Status**: SECURE
+
+Analysis:
+- Each account's warmup conversion reads haircut fresh from current state
+- Two-pass settlement (loss first, profit second) ensures correct ordering
+- Account processing order in keeper_crank is deterministic (by index)
+- Users cannot control their index position
+- Final state is conserved regardless of order
+
+**Finding**: No race condition - haircut computed correctly per-account
+
+#### 192. Funding Payment Warmup Bypass ✓
+**Hypothesis**: Can funding payments be extracted without warmup vesting?
+**Status**: SECURE
+
+Analysis:
+- Funding payments go to PnL (not capital)
+- AvailGross increase triggers warmup restart
+- All positive PnL goes through same warmup funnel
+- No "pre-warmup" vs "post-warmup" PnL distinction
+- Withdrawal requires capital, not PnL
+
+**Finding**: Funding properly subject to warmup restrictions
+
+#### 193. LP Risk Gate Griefing ✓
+**Hypothesis**: Can attacker toggle gate to block legitimate trades?
+**Status**: NOT ECONOMICALLY VIABLE
+
+Analysis:
+- Insurance fund only decreases via actual protocol losses
+- Attacker must lose capital to deplete insurance
+- Cost exceeds benefit (attacker loses > gate duration value)
+- Threshold is admin-controlled or EWMA-smoothed
+- Risk-reducing trades always allowed (no lockout)
+
+**Finding**: Griefing attack costs more than it benefits
+
+#### 194. Position Flip Entry Price Manipulation ✓
+**Hypothesis**: Can flip transition create "phantom" PnL?
+**Status**: SECURE
+
+Analysis:
+- Mark settlement occurs BEFORE position changes
+- Entry price reset to oracle after settlement
+- Trade PnL uses oracle/exec_price, not entry_price
+- crosses_zero requires initial_margin (10%)
+- No intermediate state (position=0) exposure
+
+**Finding**: Flip accounting is correct
+
+#### 195. Zero exec_size with PARTIAL_OK ✓
+**Hypothesis**: Can zero-fills drain fees or manipulate state?
+**Status**: INTENDED BEHAVIOR
+
+Analysis:
+- ABI validation properly gates zero with PARTIAL_OK
+- execute_trade returns early on exec_size=0
+- No fees charged, no position changes
+- Only funding settlement occurs (correct)
+- Nonce advances but harmlessly
+
+**Finding**: Zero-fills are a designed feature, not a bug
+
+#### 196. Conservation Invariant Violation ✓
+**Hypothesis**: Can aggregate staleness create accounting gaps?
+**Status**: SECURE
+
+Analysis:
+- Aggregate updates via set_capital/set_pnl are atomic
+- Temporary staleness window protected by Solana atomicity
+- No partial transaction completion possible
+- haircut_ratio always reads current aggregates
+- Two-pass settlement ensures correct ordering
+
+**Finding**: Solana atomicity prevents exploitation
+
+### Novel Attack Vector Summary
+
+| Attack Vector | Hypothesis | Result |
+|---------------|------------|--------|
+| Haircut/warmup race | Processing order affects distribution | SECURE |
+| Funding warmup bypass | Extract funding without vesting | SECURE |
+| Risk gate griefing | Toggle gate to block others | UNECONOMICAL |
+| Position flip phantom PnL | Double-count during flip | SECURE |
+| Zero exec_size abuse | Drain fees with zero trades | INTENDED |
+| Conservation violation | Aggregate staleness exploit | SECURE |
+
+## Session 14 Summary
+
+**Novel Hypotheses Tested**: 6
+**Vulnerabilities Found**: 0
+**Attack Vectors Deemed Uneconomical**: 1
+
+All tested combination attacks and edge cases are properly defended through:
+- Correct operation ordering
+- Solana transaction atomicity
+- Economic disincentives
+- Defense-in-depth design
