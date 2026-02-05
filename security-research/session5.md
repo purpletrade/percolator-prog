@@ -1607,3 +1607,80 @@ Comprehensive unit tests (20 tests covering edge cases)
 **All 57 Integration Tests**: PASS
 
 Comprehensive coverage complete across all programs.
+
+---
+
+## Session 8 (2026-02-05 continued)
+
+### MEV & Sandwich Attack Analysis
+
+#### 120. MEV Defense Architecture ✓
+**Status**: SECURE (comprehensive defenses)
+
+**Pinned Price CPI Model**:
+- Oracle price sent to matcher, echoed back in ABI
+- Matcher cannot lie about oracle price
+- ABI validation at `verify::abi_ok()`
+
+**Circuit Breaker Coverage**:
+1. External oracle read → `last_effective_price_e6`
+2. Authority oracle push → clamped before storing
+3. Hyperp execution price → clamped before mark update
+
+**Slot-Boundary Protections**:
+- Bug #9 fixed (dt=0 now returns index, not mark)
+- Same-slot operations guarded by storing update slots
+
+**No Price Caching**:
+- Each trade reads fresh oracle price
+- No MEV-friendly cross-transaction caching
+
+#### 121. Oracle Authority Sandwich Risk ✓
+**Location**: `percolator-prog/src/percolator.rs:3479-3513`
+**Status**: MITIGATED
+
+Potential attack:
+1. Authority front-runs with PushOraclePrice
+2. Trade executes at manipulated price
+3. Authority back-runs with different price
+
+Mitigations:
+- Circuit breaker clamps all pushed prices
+- Staleness check rejects old authority prices
+- Hyperp mode: 1% per slot max change
+
+**Recommendation**: For sensitive markets, use Pyth/Chainlink only (no authority)
+
+#### 122. Nonce Replay Protection ✓
+**Location**: `percolator-prog/src/percolator.rs:2963-2967, 3110`
+**Status**: SECURE
+
+- Monotonic nonce increments after each trade
+- req_id = nonce, echoed in CPI return
+- Replay of old trade requests impossible
+
+#### 123. Risk Gate Timing ✓
+**Location**: `percolator-prog/src/percolator.rs:2868-2894`
+**Status**: MITIGATED
+
+- Risk state computed fresh per trade (O(n) scan)
+- Not cached between transactions
+- No sandwich opportunity to force gate active
+
+### MEV Vulnerability Summary
+
+| Attack Vector | Risk | Status |
+|---------------|------|--------|
+| Hyperp index smoothing (dt=0) | Critical | FIXED |
+| Oracle authority front-run | Moderate | MITIGATED |
+| Matcher exec price drift | Low | MITIGATED |
+| Stale price acceptance | Critical | DEFENDED |
+| Nonce replay | High | SECURED |
+| Risk gate sandwich | Low | MITIGATED |
+| Hyperp mark manipulation | High | SECURED |
+
+## Session 8 Summary
+
+**Total Areas Verified**: 123
+**New Vulnerabilities Found**: 0
+**MEV Defenses**: Comprehensive
