@@ -977,15 +977,47 @@ The codebase demonstrates excellent security practices:
 
 **Total Areas Verified**: 72
 **New Vulnerabilities Found**: 0
-**Open Issues**: 1 (Bug #9 - Hyperp index smoothing bypass, documented)
+**Open Issues**: 0
 
 The Percolator codebase demonstrates excellent security practices across all reviewed areas.
 
-## Known Open Issue
+## Bug #9 - FIXED (2026-02-05)
 
 **Bug #9**: Hyperp index smoothing bypass (clamp_toward_with_dt returns mark when dt=0)
-- **Status**: DOCUMENTED, NOT FIXED
-- **Test**: `test_hyperp_index_smoothing_multiple_cranks_same_slot`
-- **Severity**: Medium (requires multiple TXs in same slot, each costs fees)
-- **Recommendation**: Return `index` instead of `mark` when dt=0
-- See MEMORY.md and test for full analysis
+- **Status**: FIXED
+- **Fix**: Changed `clamp_toward_with_dt` to return `index` (no movement) when dt=0 or cap=0
+- **Test**: `test_hyperp_index_smoothing_multiple_cranks_same_slot` - updated to verify fix
+- **Commit**: 80cc98e
+
+## Session 6: Continued Security Research (2026-02-05)
+
+### Additional Areas Verified
+
+#### 73. vAMM Matcher Arithmetic ✓
+**Location**: `percolator-match/src/vamm.rs:460-612`
+**Status**: SECURE
+
+- Uses checked_mul for all multiplications
+- Validates max_total_bps <= 9000 (prevents underflow in BPS_DENOM - total_bps)
+- trading_fee_bps capped at 1000
+- Inventory tracking uses saturating_add/saturating_sub
+- exec_price bounds checked (0, u64::MAX)
+
+#### 74. Funding Rate Protection ✓
+**Location**: `percolator/src/percolator.rs:2106-2148`
+**Status**: SECURE
+
+- Rate capped at ±10,000 bps/slot
+- dt capped at ~1 year (31,536,000 slots)
+- Uses checked_mul/checked_div throughout
+- Anti-retroactivity: stored rate used, not new rate
+- funding_index uses checked_add (returns Overflow on fail)
+
+#### 75. Fee Calculation Safety ✓
+**Location**: `percolator/src/percolator.rs:2011-2016, 2822-2824`
+**Status**: SECURE
+
+- Uses mul_u128 (saturating) for notional × fee_bps
+- Ceiling division for conservative fee capture
+- liquidation_fee_cap applied to limit fees
+- No parameter validation needed - saturating ops prevent overflow
