@@ -531,7 +531,7 @@ Implements: Eq_real_i = max(0, C_i + min(PNL_i, 0) + PNL_eff_pos_i)
 
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 48
+**Total Areas Verified This Session**: 49
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
@@ -635,7 +635,18 @@ Post-CPI validation:
 - Cursor advancement with masking
 - Budget-limited (GC_CLOSE_BUDGET)
 
-#### 48. I128/U128 BPF-Safe Types ✓
+#### 48. Math Helpers ✓
+**Location**: `percolator/src/percolator.rs:480-560`
+**Status**: SECURE
+
+- add_u128/sub_u128/mul_u128: All use saturating_* (safe)
+- div_u128: Returns error on division by zero
+- clamp_pos_i128/clamp_neg_i128: Safe type conversion
+- saturating_abs_i128: Handles i128::MIN → i128::MAX
+- neg_i128_to_u128: Handles i128::MIN → (i128::MAX + 1)
+- u128_to_i128_clamped: Clamps > i128::MAX
+
+#### 49. I128/U128 BPF-Safe Types ✓
 **Location**: `percolator/src/i128.rs`
 **Status**: SECURE
 
