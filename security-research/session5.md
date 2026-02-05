@@ -1466,8 +1466,47 @@ I128 type:
 Both Kani and BPF versions have same behavior
 180+ uses of saturating/checked arithmetic throughout codebase
 
+#### 112. Bitmap Integrity ✓
+**Location**: `percolator/src/percolator.rs:714-763`
+**Status**: SECURE
+
+`is_used`:
+- Bounds check `idx >= MAX_ACCOUNTS` returns false
+- Bit extraction: `(used[w] >> b) & 1`
+
+`for_each_used` / `for_each_used_mut`:
+- Guard against stray high bits: `if idx >= MAX_ACCOUNTS { continue }`
+- Efficient bit-walking: `w &= w - 1` clears lowest bit
+
+#### 113. Freelist Integrity ✓
+**Location**: `percolator/src/percolator.rs:867-877, 1329-1335`
+**Status**: SECURE
+
+`alloc_slot`:
+- Checks `free_head == u16::MAX` (list empty) → Overflow error
+- Updates head, sets used bit, increments counter (saturating)
+
+`free_slot`:
+- Clears account to empty_account()
+- Clears used bit
+- Pushes to freelist head
+- Decrements counter (saturating)
+
+No external trust boundary - purely internal state
+
+#### 114. Clock Sysvar Trust ✓
+**Location**: `percolator-prog/src/percolator.rs:2362, 2513, etc.`
+**Status**: SECURE
+
+- Uses `Clock::from_account_info(a_clock)?`
+- Solana runtime validates clock is the system Clock sysvar
+- Cannot be spoofed - owned by system program with correct format
+- `clock.slot` and `clock.unix_timestamp` are blockchain truth
+
+No user manipulation possible for timing attacks
+
 ## Session 7 Summary (Updated)
 
-**Total Areas Verified**: 111
+**Total Areas Verified**: 114
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
