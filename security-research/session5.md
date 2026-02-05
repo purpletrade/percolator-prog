@@ -1426,8 +1426,48 @@ Checks before close:
 
 **Warning**: `unsafe_close` feature skips ALL validation
 
+#### 109. Token Program Compatibility ✓
+**Location**: `percolator-prog/src/percolator.rs:2248-2253`
+**Status**: SECURE (Standard SPL Token only)
+
+- `verify_token_program` checks `*a_token.key != spl_token::ID`
+- Only accepts standard SPL Token, NOT Token-2022
+- Vault/token account validation: owner, data_len, AccountState::Initialized
+- Mint validation: owner + LEN check
+
+#### 110. Initialization State Machine ✓
+**Location**: `percolator-prog/src/percolator.rs:2176-2180, 2347`
+**Status**: SECURE
+
+InitMarket:
+- Checks `header.magic == MAGIC` → rejects re-initialization (AlreadyInitialized)
+- Sets magic only after all validation passes
+
+All other instructions:
+- Use `require_initialized()` → checks magic + version
+- Rejects uninitialized slabs
+
+No race condition: magic set atomically within InitMarket transaction
+
+#### 111. BPF-Safe 128-bit Arithmetic ✓
+**Location**: `percolator/src/i128.rs`
+**Status**: SECURE
+
+U128 type:
+- All Add/Sub operators use saturating arithmetic
+- `impl Add<u128> for U128` → `saturating_add`
+- `impl Sub<u128> for U128` → `saturating_sub`
+
+I128 type:
+- Same pattern with signed arithmetic
+- `impl Add<i128> for I128` → `saturating_add`
+- `impl Sub<i128> for I128` → `saturating_sub`
+
+Both Kani and BPF versions have same behavior
+180+ uses of saturating/checked arithmetic throughout codebase
+
 ## Session 7 Summary (Updated)
 
-**Total Areas Verified**: 108
+**Total Areas Verified**: 111
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
