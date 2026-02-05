@@ -531,7 +531,7 @@ Implements: Eq_real_i = max(0, C_i + min(PNL_i, 0) + PNL_eff_pos_i)
 
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 44
+**Total Areas Verified This Session**: 47
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
@@ -613,6 +613,27 @@ Post-CPI validation:
 - Risk reduction gate uses actual exec_size
 - State modified AFTER CPI returns
 - Nonce written AFTER execute_trade
+
+#### 46. free_slot ✓
+**Location**: `percolator/src/percolator.rs:1329-1335`
+**Status**: SECURE
+
+- Clears account (empty_account())
+- Clears bitmap (clear_used)
+- Returns slot to free list (free_head)
+- Decrements num_used_accounts with saturating_sub
+
+#### 47. garbage_collect_dust ✓
+**Location**: `percolator/src/percolator.rs:1351-1425`
+**Status**: SECURE
+
+- **NEVER GCs LPs** (critical for market operation)
+- Dust predicate: position=0, capital=0, reserved=0, pnl<=0
+- Best-effort fee settle before dust check
+- Funding snap for flat positions
+- Negative PnL write-off via set_pnl
+- Cursor advancement with masking
+- Budget-limited (GC_CLOSE_BUDGET)
 
 ## Known Open Issue
 
