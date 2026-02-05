@@ -1068,3 +1068,36 @@ The Percolator codebase demonstrates excellent security practices across all rev
 - Returns None if inverted == 0 (underflow protection)
 - Returns None if inverted > u64::MAX (overflow protection)
 - Inversion constant = 10^12 for e6 * e6 = e12
+
+#### 81. TradeCpi Full Flow ✓
+**Location**: `percolator-prog/src/percolator.rs:2904-3127`
+**Status**: SECURE
+
+- 8-account layout validation
+- Matcher shape: program executable, context not, context owned by program
+- LP PDA: correct derivation, system-owned, zero data, zero lamports
+- Owner authorization for both user and LP
+- Matcher identity binding (program + context match LP registration)
+- Nonce written AFTER successful trade (replay protection)
+- ABI validation: req_id, lp_account_id, oracle_price_e6 must match
+- Risk reduction gate with O(1) LP risk computation
+- Hyperp mark price clamped against index
+
+#### 82. Freelist Management ✓
+**Location**: `percolator/src/percolator.rs:867-887`
+**Status**: SECURE
+
+- free_head = u16::MAX means no free slots (sentinel)
+- alloc_slot checks empty freelist, returns Overflow
+- free_slot returns slot to freelist head
+- num_used_accounts counter maintained atomically
+- Proper initialization: 0 -> 1 -> ... -> 4095 -> MAX
+
+#### 83. Reserved PnL ✓
+**Location**: `percolator/src/percolator.rs:117-119`
+**Status**: SECURE
+
+- Initialized to 0 for new accounts
+- Subtracted from positive PnL to get available gross
+- Must be 0 for GC (prevents closing with reserved funds)
+- u64 type matches on-chain layout
