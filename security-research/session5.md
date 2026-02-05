@@ -2223,3 +2223,167 @@ Protections:
 **New Vulnerabilities Found**: 0
 **LP Security**: All 6 attack vectors defended
 **Timing Security**: All 6 attack vectors defended
+
+---
+
+## Session 11 (2026-02-05 continued)
+
+### Authorization Bypass Analysis
+
+#### 158. admin_ok Function ✓
+**Location**: `percolator-prog/src/percolator.rs:241-243`
+**Status**: SECURE (Kani-proven)
+
+```rust
+pub fn admin_ok(admin: [u8; 32], signer: [u8; 32]) -> bool {
+    admin != [0u8; 32] && admin == signer
+}
+```
+
+Two-part verification:
+- Part 1: admin != zero (burned admin disables all ops)
+- Part 2: admin == signer (strict byte comparison)
+
+**Risk**: None (mathematically sound, formally verified)
+
+#### 159. Zero-Address Admin Burn ✓
+**Location**: `percolator-prog/src/percolator.rs:3329`
+**Status**: DESIGN CHOICE
+
+- UpdateAdmin allows setting admin to zero
+- Once burned, NO admin operations possible
+- Intentional privilege revocation mechanism
+- Only current admin can burn themselves
+
+**Risk**: Low (requires admin action, irreversible by design)
+
+#### 160. UpdateAdmin Security ✓
+**Location**: `percolator-prog/src/percolator.rs:3314-3331`
+**Status**: SECURE
+
+Defenses:
+- expect_signer on a_admin
+- slab_guard validates ownership
+- require_admin checks current admin
+- New admin stored after validation
+
+**Risk**: None (except intentional zero-burn)
+
+#### 161. SetOracleAuthority Security ✓
+**Location**: `percolator-prog/src/percolator.rs:3455-3477`
+**Status**: SECURE
+
+Protections:
+- require_admin check
+- Clears stored price on authority change
+- Zero authority returns error on PushOraclePrice
+- Circuit breaker clamps all pushed prices
+
+**Risk**: None (admin-controlled, rate-limited)
+
+#### 162. Signer Substitution Prevention ✓
+**Location**: Multiple
+**Status**: SECURE
+
+Defenses:
+- expect_signer checks is_signer flag (Solana runtime)
+- Key comparison: `admin != *a_admin.key`
+- No fuzzy matching or special accounts
+- No derived account confusion
+
+**Risk**: None (cryptographically enforced)
+
+#### 163. Permission Elevation Prevention ✓
+**Status**: SECURE
+
+All admin operations use require_admin():
+- SetRiskThreshold, UpdateAdmin, SetOracleAuthority
+- SetMaintenanceFee, UpdateConfig, SetOraclePriceCap
+- CloseSlab, KeeperCrank (allow_panic)
+
+Test coverage confirms rejection of non-admin calls.
+
+**Risk**: None (consistent authorization pattern)
+
+### Instruction Sequence Analysis
+
+#### 164. Double InitMarket Prevention ✓
+**Location**: `percolator-prog/src/percolator.rs:2346-2347`
+**Status**: SECURE
+
+Check: `if header.magic == MAGIC { return Err(AlreadyInitialized) }`
+- Mutable lock prevents simultaneous writes
+- Second transaction sees MAGIC already set
+
+**Risk**: None (race condition impossible)
+
+#### 165. Nonce-Based Replay Protection ✓
+**Location**: `percolator-prog/src/percolator.rs:2965-3110`
+**Status**: SECURE
+
+Mechanism:
+- Nonce read BEFORE CPI (line 2965)
+- req_id echoed in matcher response
+- ABI validation: req_id must match (line 3061)
+- Nonce written AFTER trade (line 3110)
+
+**Risk**: None (replay of old responses rejected)
+
+#### 166. Deposit → Trade → Withdraw Ordering ✓
+**Status**: SECURE
+
+Protections:
+- Deposit: transfer first, then engine update
+- Trade: margin check before position commit
+- Withdraw: engine check before transfer
+- Solana atomicity ensures all-or-nothing
+
+**Risk**: None (proper operation ordering)
+
+#### 167. KeeperCrank Ordering ✓
+**Status**: SECURE
+
+Same-slot protections:
+- dt=0 prevents double funding accrual
+- Hyperp index smoothing: dt=0 returns index (Bug #9 fix)
+- Liquidation uses current state (no stale reads)
+
+**Risk**: None (same-slot operations are no-ops)
+
+#### 168. LP Registration Ordering ✓
+**Location**: `percolator-prog/src/percolator.rs:2935-2950`
+**Status**: SECURE
+
+TradeCpi validates:
+- LP PDA derivation matches expected
+- PDA is system-owned, zero data, zero lamports
+- If InitLP incomplete, TradeCpi fails
+
+**Risk**: None (PDA validation prevents spoofing)
+
+### Authorization Attack Summary
+
+| Attack Vector | Status | Defense |
+|---------------|--------|---------|
+| admin_ok bypass | SECURE | Kani-proven logic |
+| Zero-address escalation | DESIGN | Only admin can burn |
+| Signer spoofing | SECURE | Solana runtime + key match |
+| Permission elevation | SECURE | require_admin everywhere |
+| Account reordering | SECURE | slab_guard + length checks |
+
+### Instruction Sequence Summary
+
+| Sequence Attack | Status | Defense |
+|-----------------|--------|---------|
+| Double InitMarket | SECURE | Magic number check |
+| TradeCpi replay | SECURE | Monotonic nonce |
+| Deposit/Trade/Withdraw race | SECURE | Solana atomicity |
+| Double crank funding | SECURE | dt=0 gate |
+| LP registration race | SECURE | PDA validation |
+
+## Session 11 Summary
+
+**Total Areas Verified**: 168
+**New Vulnerabilities Found**: 0
+**Authorization Security**: All 6 vectors defended
+**Instruction Sequence Security**: All 5 vectors defended
