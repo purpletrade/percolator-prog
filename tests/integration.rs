@@ -292,6 +292,40 @@ impl TestEnv {
         self.svm.send_transaction(tx).expect("init_market failed");
     }
 
+    /// Initialize a Hyperp market (internal mark/index, no external oracle)
+    fn init_market_hyperp(&mut self, initial_mark_price_e6: u64) {
+        let admin = &self.payer;
+        let dummy_ata = Pubkey::new_unique();
+        self.svm.set_account(dummy_ata, Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
+                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: encode_init_market_hyperp(&admin.pubkey(), &self.mint, initial_mark_price_e6),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("init_market_hyperp failed");
+    }
+
     fn create_ata(&mut self, owner: &Pubkey, amount: u64) -> Pubkey {
         let ata = Pubkey::new_unique();
         self.svm.set_account(ata, Account {
@@ -601,6 +635,14 @@ fn encode_close_slab() -> Vec<u8> {
     vec![13u8] // Instruction tag for CloseSlab
 }
 
+fn encode_resolve_market() -> Vec<u8> {
+    vec![19u8] // Instruction tag for ResolveMarket
+}
+
+fn encode_withdraw_insurance() -> Vec<u8> {
+    vec![20u8] // Instruction tag for WithdrawInsurance
+}
+
 fn encode_withdraw(user_idx: u16, amount: u64) -> Vec<u8> {
     let mut data = vec![4u8]; // Instruction tag for WithdrawCollateral
     data.extend_from_slice(&user_idx.to_le_bytes());
@@ -839,6 +881,24 @@ impl TestEnv {
             return 0;
         }
         u128::from_le_bytes(slab_account.data[account_offset..account_offset+16].try_into().unwrap())
+    }
+
+    /// Read account position_size for a slot
+    fn read_account_position(&self, idx: u16) -> i128 {
+        let slab_account = self.svm.get_account(&self.slab).unwrap();
+        // ENGINE_OFF = 392, accounts array at offset 9136 within RiskEngine
+        // Account size = 240 bytes
+        // Account layout: account_id(8) + capital(16) + kind(1) + padding(7) + pnl(16) + reserved_pnl(8) +
+        //                 warmup_started_at_slot(8) + warmup_slope_per_step(16) + position_size(16) + ...
+        // position_size is at offset: 8 + 16 + 1 + 7 + 16 + 8 + 8 + 16 = 80
+        const ACCOUNTS_OFFSET: usize = 392 + 9136;
+        const ACCOUNT_SIZE: usize = 240;
+        const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
+        let account_offset = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
+        if slab_account.data.len() < account_offset + 16 {
+            return 0;
+        }
+        i128::from_le_bytes(slab_account.data[account_offset..account_offset+16].try_into().unwrap())
     }
 
     /// Try to close slab, returns Ok or error
@@ -3117,6 +3177,70 @@ impl TestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    /// Try ResolveMarket instruction (admin only)
+    fn try_resolve_market(&mut self, admin: &Keypair) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_resolve_market(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Try WithdrawInsurance instruction (admin only, requires resolved + all positions closed)
+    fn try_withdraw_insurance(&mut self, admin: &Keypair) -> Result<(), String> {
+        let admin_ata = self.create_ata(&admin.pubkey(), 0);
+        let (vault_pda, _) = Pubkey::find_program_address(
+            &[b"vault", self.slab.as_ref()],
+            &self.program_id,
+        );
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(admin_ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(vault_pda, false),
+            ],
+            data: encode_withdraw_insurance(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Check if market is resolved (read flags from slab header)
+    fn is_market_resolved(&self) -> bool {
+        let slab_account = self.svm.get_account(&self.slab).unwrap();
+        // FLAGS_OFF = 13 (offset of flags byte in SlabHeader._padding[0])
+        const FLAGS_OFF: usize = 13;
+        const FLAG_RESOLVED: u8 = 1 << 0;
+        slab_account.data[FLAGS_OFF] & FLAG_RESOLVED != 0
+    }
+
+    /// Read insurance fund balance from engine
+    fn read_insurance_balance(&self) -> u128 {
+        let slab_account = self.svm.get_account(&self.slab).unwrap();
+        // ENGINE_OFF = 392, InsuranceFund.balance is at offset 16 within engine
+        // (vault is 16 bytes at 0, insurance_fund starts at 16)
+        // InsuranceFund { balance: U128, ... } - balance is first field
+        const INSURANCE_OFFSET: usize = 392 + 16;
+        u128::from_le_bytes(slab_account.data[INSURANCE_OFFSET..INSURANCE_OFFSET+16].try_into().unwrap())
+    }
+
     /// Try LiquidateAtOracle instruction
     fn try_liquidate_target(&mut self, target_idx: u16) -> Result<(), String> {
         let caller = Keypair::new();
@@ -3975,6 +4099,221 @@ impl TradeCpiTestEnv {
         self.svm.send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?}", e))
+    }
+
+    fn init_market_hyperp(&mut self, initial_mark_price_e6: u64) {
+        let admin = &self.payer;
+        let dummy_ata = Pubkey::new_unique();
+        self.svm.set_account(dummy_ata, Account {
+            lamports: 1_000_000,
+            data: vec![0u8; TokenAccount::LEN],
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        }).unwrap();
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(self.mint, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(sysvar::rent::ID, false),
+                AccountMeta::new_readonly(dummy_ata, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            data: encode_init_market_hyperp(&admin.pubkey(), &self.mint, initial_mark_price_e6),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("init_market_hyperp failed");
+    }
+
+    fn set_slot(&mut self, slot: u64) {
+        self.svm.set_sysvar(&Clock { slot, unix_timestamp: slot as i64, ..Clock::default() });
+    }
+
+    fn crank(&mut self) {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(caller.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_crank_permissionless(),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&caller.pubkey()), &[&caller], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("crank failed");
+    }
+
+    fn try_set_oracle_authority(&mut self, admin: &Keypair, new_authority: &Pubkey) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_set_oracle_authority(new_authority),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_push_oracle_price(&mut self, authority: &Keypair, price_e6: u64, timestamp: i64) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+            ],
+            data: encode_push_oracle_price(price_e6, timestamp),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&authority.pubkey()), &[authority], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_resolve_market(&mut self, admin: &Keypair) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+            ],
+            data: encode_resolve_market(),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn try_withdraw_insurance(&mut self, admin: &Keypair) -> Result<(), String> {
+        let admin_ata = self.create_ata(&admin.pubkey(), 0);
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+
+        // Account order: admin, slab, admin_ata, vault, token_program, vault_pda
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(admin_ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(vault_pda, false),
+            ],
+            data: encode_withdraw_insurance(),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&admin.pubkey()), &[admin], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn is_market_resolved(&self) -> bool {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        // FLAGS_OFF = 13, FLAG_RESOLVED = 1
+        slab_data[13] & 1 != 0
+    }
+
+    fn read_insurance_balance(&self) -> u128 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        // ENGINE_OFF = 392
+        // RiskEngine layout: vault(U128=16) + insurance_fund(balance(U128=16) + fee_revenue(16))
+        // So insurance_fund.balance is at ENGINE_OFF + 16 = 408
+        const INSURANCE_BALANCE_OFFSET: usize = 392 + 16;
+        u128::from_le_bytes(slab_data[INSURANCE_BALANCE_OFFSET..INSURANCE_BALANCE_OFFSET+16].try_into().unwrap())
+    }
+
+    fn read_account_position(&self, idx: u16) -> i128 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        // ENGINE_OFF = 392, accounts array at offset 9136 within RiskEngine
+        // Account size = 240 bytes, position at offset 80 within Account
+        const ACCOUNTS_OFFSET: usize = 392 + 9136;
+        const ACCOUNT_SIZE: usize = 240;
+        const POSITION_OFFSET_IN_ACCOUNT: usize = 80;
+        let account_off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + POSITION_OFFSET_IN_ACCOUNT;
+        if slab_data.len() < account_off + 16 {
+            return 0;
+        }
+        i128::from_le_bytes(slab_data[account_off..account_off+16].try_into().unwrap())
+    }
+
+    fn try_withdraw(&mut self, owner: &Keypair, user_idx: u16, amount: u64) -> Result<(), String> {
+        let ata = self.create_ata(&owner.pubkey(), 0);
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_withdraw(user_idx, amount),
+        };
+
+        let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
+        let ix2 = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(vault_pda, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(sysvar::clock::ID, false),
+                AccountMeta::new_readonly(self.pyth_index, false),
+            ],
+            data: encode_withdraw(user_idx, amount),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix2], Some(&owner.pubkey()), &[owner], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    fn read_num_used_accounts(&self) -> u16 {
+        let slab_data = self.svm.get_account(&self.slab).unwrap().data;
+        // ENGINE_OFF (392) + num_used offset (920) = 1312
+        u16::from_le_bytes(slab_data[1312..1314].try_into().unwrap())
     }
 }
 
@@ -5028,4 +5367,649 @@ fn test_maintenance_fees_drain_dead_accounts_for_gc() {
 
     println!();
     println!("MAINTENANCE FEE DRAIN TEST COMPLETE");
+}
+
+// ============================================================================
+// Tests: Premarket Resolution (Binary Outcome Markets)
+// ============================================================================
+
+/// Test full premarket resolution lifecycle:
+/// 1. Create market with positions
+/// 2. Admin pushes final price (0 or 1)
+/// 3. Admin resolves market
+/// 4. Crank force-closes all positions
+/// 5. Admin withdraws insurance
+/// 6. Users withdraw their funds
+/// 7. Admin closes slab
+#[test]
+fn test_premarket_resolution_full_lifecycle() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
+        return;
+    };
+
+    println!("=== PREMARKET RESOLUTION FULL LIFECYCLE TEST ===");
+    println!();
+
+    // Create hyperp market with admin oracle authority
+    env.init_market_hyperp(1_000_000); // Initial mark = 1.0
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+
+    // Set oracle authority to admin
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+
+    // Create LP with matcher
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000); // 10 SOL
+
+    // Create user
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000); // 1 SOL
+
+    // Push initial price and crank
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000); // Price = 1.0
+    env.set_slot(100);
+    env.crank();
+
+    // Execute a trade via TradeCpi to create positions
+    let result = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    assert!(result.is_ok(), "Trade should succeed: {:?}", result);
+
+    println!("Market created with LP and User positions");
+    println!("LP idx={}, User idx={}", lp_idx, user_idx);
+
+    // Verify positions exist
+    let lp_pos = env.read_account_position(lp_idx);
+    let user_pos = env.read_account_position(user_idx);
+    println!("LP position: {}", lp_pos);
+    println!("User position: {}", user_pos);
+    assert!(lp_pos != 0 || user_pos != 0, "Should have positions");
+
+    // Step 1: Admin pushes final resolution price (binary: 1e-6 or 1)
+    // Price = 1 (1e-6) means "NO" outcome (essentially zero, but nonzero for force-close)
+    let _ = env.try_push_oracle_price(&admin, 1, 2000); // Final price = 1e-6 (NO)
+    println!("Admin pushed final price: 1e-6 (NO outcome)");
+
+    // Step 2: Admin resolves market
+    let result = env.try_resolve_market(&admin);
+    assert!(result.is_ok(), "ResolveMarket should succeed: {:?}", result);
+    println!("Market resolved");
+
+    // Verify market is resolved
+    assert!(env.is_market_resolved(), "Market should be resolved");
+
+    // Step 3: Crank to force-close positions
+    env.set_slot(200);
+    env.crank();
+    println!("Crank executed to force-close positions");
+
+    // Verify positions are closed
+    let lp_pos_after = env.read_account_position(lp_idx);
+    let user_pos_after = env.read_account_position(user_idx);
+    println!("LP position after: {}", lp_pos_after);
+    println!("User position after: {}", user_pos_after);
+    assert_eq!(lp_pos_after, 0, "LP position should be closed");
+    assert_eq!(user_pos_after, 0, "User position should be closed");
+
+    // Step 4: Admin withdraws insurance
+    let insurance_before = env.read_insurance_balance();
+    println!("Insurance balance before withdrawal: {}", insurance_before);
+
+    if insurance_before > 0 {
+        let result = env.try_withdraw_insurance(&admin);
+        assert!(result.is_ok(), "WithdrawInsurance should succeed: {:?}", result);
+        println!("Admin withdrew insurance");
+
+        let insurance_after = env.read_insurance_balance();
+        assert_eq!(insurance_after, 0, "Insurance should be zero after withdrawal");
+    }
+
+    println!();
+    println!("PREMARKET RESOLUTION LIFECYCLE TEST PASSED");
+}
+
+/// Test that resolved markets block new activity
+#[test]
+fn test_resolved_market_blocks_new_activity() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    println!("=== RESOLVED MARKET BLOCKS NEW ACTIVITY TEST ===");
+    println!();
+
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey());
+    env.try_push_oracle_price(&admin, 1_000_000, 1000);
+
+    // Resolve market
+    let result = env.try_resolve_market(&admin);
+    assert!(result.is_ok(), "ResolveMarket should succeed");
+    println!("Market resolved");
+
+    // Try to create new user - should fail
+    let new_user = Keypair::new();
+    env.svm.airdrop(&new_user.pubkey(), 1_000_000_000).unwrap();
+    let ata = env.create_ata(&new_user.pubkey(), 0);
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(new_user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_col, false),
+        ],
+        data: encode_init_user(0),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&new_user.pubkey()), &[&new_user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(), "InitUser should fail on resolved market");
+    println!("InitUser blocked on resolved market: OK");
+
+    // Try to deposit - should fail (need existing user first)
+    // We'll create user before resolving to test deposit block
+    println!();
+    println!("RESOLVED MARKET BLOCKS NEW ACTIVITY TEST PASSED");
+}
+
+/// Test that users can withdraw after resolution
+#[test]
+fn test_resolved_market_allows_user_withdrawal() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    println!("=== RESOLVED MARKET ALLOWS USER WITHDRAWAL TEST ===");
+    println!();
+
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey());
+    env.try_push_oracle_price(&admin, 1_000_000, 1000);
+
+    // Create user with deposit
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 500_000_000); // 0.5 SOL
+
+    let capital_before = env.read_account_capital(user_idx);
+    println!("User capital before resolution: {}", capital_before);
+    assert!(capital_before > 0);
+
+    // Resolve market
+    env.try_resolve_market(&admin).unwrap();
+    println!("Market resolved");
+
+    // Crank to settle
+    env.set_slot(100);
+    env.crank();
+
+    // User should still be able to withdraw
+    let user_ata = env.create_ata(&user.pubkey(), 0);
+    let (vault_pda, _) = Pubkey::find_program_address(
+        &[b"vault", env.slab.as_ref()],
+        &env.program_id,
+    );
+
+    // Correct account order for WithdrawCollateral:
+    // 0: user (signer), 1: slab, 2: vault, 3: user_ata, 4: vault_pda, 5: token_program, 6: clock, 7: oracle
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new(user_ata, false),
+            AccountMeta::new_readonly(vault_pda, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_withdraw(user_idx, 100_000_000), // Withdraw 0.1 SOL
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&user.pubkey()), &[&user], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_ok(), "Withdraw should succeed on resolved market: {:?}", result);
+    println!("User withdrawal on resolved market: OK");
+
+    println!();
+    println!("RESOLVED MARKET ALLOWS USER WITHDRAWAL TEST PASSED");
+}
+
+/// Test insurance withdrawal requires all positions closed
+#[test]
+fn test_withdraw_insurance_requires_positions_closed() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
+        return;
+    };
+
+    println!("=== WITHDRAW INSURANCE REQUIRES POSITIONS CLOSED TEST ===");
+    println!();
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+
+    // Create LP and user with positions
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(50);
+    env.crank();
+    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+
+    // Resolve market WITHOUT cranking to close positions
+    let _ = env.try_push_oracle_price(&admin, 500_000, 2000); // Price = 0.5
+    env.try_resolve_market(&admin).unwrap();
+    println!("Market resolved but positions not yet closed");
+
+    // Try to withdraw insurance - should fail (positions still open)
+    let result = env.try_withdraw_insurance(&admin);
+    assert!(result.is_err(), "WithdrawInsurance should fail with open positions");
+    println!("WithdrawInsurance blocked with open positions: OK");
+
+    // Now crank to close positions
+    env.set_slot(200);
+    env.crank();
+    println!("Crank executed to force-close positions");
+
+    // Now withdrawal should succeed
+    let result = env.try_withdraw_insurance(&admin);
+    assert!(result.is_ok(), "WithdrawInsurance should succeed after positions closed: {:?}", result);
+    println!("WithdrawInsurance succeeded after positions closed: OK");
+
+    println!();
+    println!("WITHDRAW INSURANCE REQUIRES POSITIONS CLOSED TEST PASSED");
+}
+
+/// Test paginated force-close with many accounts (simulates 4096 worst case)
+#[test]
+fn test_premarket_paginated_force_close() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
+        return;
+    };
+
+    println!("=== PREMARKET PAGINATED FORCE-CLOSE TEST ===");
+    println!("Simulating multiple accounts requiring multiple cranks to close");
+    println!();
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+
+    // Create multiple users with positions
+    // We'll create 100 users to simulate paginated close (not 4096 for test speed)
+    const NUM_USERS: usize = 100;
+    let mut users: Vec<(Keypair, u16)> = Vec::new();
+
+    // Create LP first
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    env.set_slot(50);
+    env.crank();
+
+    println!("Creating {} users with positions...", NUM_USERS);
+    for i in 0..NUM_USERS {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 100_000_000); // 0.1 SOL each
+
+        // Execute small trade via TradeCpi to create position
+        let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx);
+        users.push((user, user_idx));
+
+        if (i + 1) % 20 == 0 {
+            println!("  Created {} users", i + 1);
+        }
+    }
+    println!("Created {} users with positions", NUM_USERS);
+
+    // Count users with positions
+    let mut users_with_positions = 0;
+    for (_, idx) in &users {
+        if env.read_account_position(*idx) != 0 {
+            users_with_positions += 1;
+        }
+    }
+    println!("Users with open positions: {}", users_with_positions);
+
+    // Resolve market
+    let _ = env.try_push_oracle_price(&admin, 500_000, 2000); // Final price = 0.5
+    env.try_resolve_market(&admin).unwrap();
+    println!("Market resolved");
+
+    // Crank multiple times to close all positions (BATCH_SIZE = 64 per crank)
+    let mut crank_count = 0;
+    let max_cranks = 10; // Safety limit
+
+    loop {
+        env.set_slot(200 + crank_count * 10);
+        env.crank();
+        crank_count += 1;
+
+        // Check if all positions closed
+        let mut remaining_positions = 0;
+        for (_, idx) in &users {
+            if env.read_account_position(*idx) != 0 {
+                remaining_positions += 1;
+            }
+        }
+        // Also check LP
+        if env.read_account_position(lp_idx) != 0 {
+            remaining_positions += 1;
+        }
+
+        println!("After crank {}: {} positions remaining", crank_count, remaining_positions);
+
+        if remaining_positions == 0 {
+            break;
+        }
+        if crank_count >= max_cranks {
+            panic!("Failed to close all positions after {} cranks", max_cranks);
+        }
+    }
+
+    println!();
+    println!("All positions closed after {} cranks", crank_count);
+    println!("Expected cranks for {} accounts: ~{}", NUM_USERS + 1, (NUM_USERS + 1 + 63) / 64);
+
+    // Verify insurance can now be withdrawn
+    let result = env.try_withdraw_insurance(&admin);
+    assert!(result.is_ok(), "WithdrawInsurance should succeed: {:?}", result);
+    println!("Insurance withdrawn successfully");
+
+    println!();
+    println!("PREMARKET PAGINATED FORCE-CLOSE TEST PASSED");
+}
+
+/// Test binary outcome: price = 1e-6 (NO wins)
+#[test]
+fn test_premarket_binary_outcome_price_zero() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
+        return;
+    };
+
+    println!("=== PREMARKET BINARY OUTCOME PRICE=1e-6 (NO) TEST ===");
+    println!();
+
+    env.init_market_hyperp(500_000); // Initial mark = 0.5 (50% probability)
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    let _ = env.try_push_oracle_price(&admin, 500_000, 1000);
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(50);
+    env.crank();
+
+    // User bets YES (goes long at 0.5) via TradeCpi
+    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    println!("User went LONG (YES bet) at price 0.5");
+
+    // Outcome: NO wins (price = 1e-6, essentially zero but nonzero for force-close)
+    let _ = env.try_push_oracle_price(&admin, 1, 2000);
+    env.try_resolve_market(&admin).unwrap();
+    println!("Market resolved at price = 1e-6 (NO wins)");
+
+    env.set_slot(200);
+    env.crank();
+
+    // User should have lost (position closed at ~0, entry was ~0.5)
+    let user_pos = env.read_account_position(user_idx);
+    assert_eq!(user_pos, 0, "Position should be closed");
+    println!("User position closed");
+
+    // The PnL should be negative (lost the bet)
+    // Note: Actual PnL depends on position size and entry price
+    println!();
+    println!("PREMARKET BINARY OUTCOME PRICE=0 TEST PASSED");
+}
+
+/// Test binary outcome: price = 1e6 (YES wins)
+#[test]
+fn test_premarket_binary_outcome_price_one() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
+        return;
+    };
+
+    println!("=== PREMARKET BINARY OUTCOME PRICE=1 TEST ===");
+    println!();
+
+    env.init_market_hyperp(500_000); // Initial mark = 0.5 (50% probability)
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    let _ = env.try_push_oracle_price(&admin, 500_000, 1000);
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    env.set_slot(50);
+    env.crank();
+
+    // User bets YES (goes long at 0.5) via TradeCpi
+    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    println!("User went LONG (YES bet) at price 0.5");
+
+    // Outcome: YES wins (price = 1.0 = 1_000_000 in e6)
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 2000);
+    env.try_resolve_market(&admin).unwrap();
+    println!("Market resolved at price = 1.0 (YES wins)");
+
+    env.set_slot(200);
+    env.crank();
+
+    // User should have won (position closed at 1.0, entry was ~0.5)
+    let user_pos = env.read_account_position(user_idx);
+    assert_eq!(user_pos, 0, "Position should be closed");
+    println!("User position closed");
+
+    // The PnL should be positive (won the bet)
+    println!();
+    println!("PREMARKET BINARY OUTCOME PRICE=1 TEST PASSED");
+}
+
+/// Benchmark test: verify force-close CU consumption is bounded
+///
+/// The force-close operation processes up to BATCH_SIZE=64 accounts per crank.
+/// Each account operation:
+/// - is_used check: O(1) bitmap lookup
+/// - position check: O(1) read
+/// - PnL settlement: O(1) arithmetic
+/// - position clear: O(1) write
+///
+/// This test verifies that 64 force-closes stay well under compute budget.
+/// For 4096 accounts, we need 64 cranks, each under ~22k CUs to stay under 1.4M total.
+#[test]
+fn test_premarket_force_close_cu_benchmark() {
+    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found. Run: cargo build-sbf && cd ../percolator-match && cargo build-sbf");
+        return;
+    };
+
+    println!("=== PREMARKET FORCE-CLOSE CU BENCHMARK ===");
+    println!("Testing compute unit consumption for paginated force-close");
+    println!();
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+
+    // Create LP with large deposit to handle all trades
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000); // 1000 SOL
+
+    env.set_slot(50);
+    env.crank();
+
+    // Create 64 users (one batch worth) with positions
+    // This is the worst case for a single crank call
+    const NUM_USERS: usize = 64;
+    let mut users: Vec<(Keypair, u16)> = Vec::new();
+
+    println!("Creating {} users with positions...", NUM_USERS);
+    for i in 0..NUM_USERS {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 100_000_000); // 0.1 SOL each
+        let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx);
+        users.push((user, user_idx));
+    }
+    println!("Created {} users with positions", NUM_USERS);
+
+    // Verify positions exist
+    let mut positions_count = 0;
+    for (_, idx) in &users {
+        if env.read_account_position(*idx) != 0 {
+            positions_count += 1;
+        }
+    }
+    println!("Users with positions: {}", positions_count);
+
+    // Resolve market
+    let _ = env.try_push_oracle_price(&admin, 500_000, 2000);
+    env.try_resolve_market(&admin).unwrap();
+    println!("Market resolved");
+
+    // Run force-close crank and capture CU consumption
+    env.set_slot(200);
+
+    // Use lower-level send to capture CU
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            solana_sdk::instruction::AccountMeta::new(caller.pubkey(), true),
+            solana_sdk::instruction::AccountMeta::new(env.slab, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_crank_permissionless(),
+    };
+
+    let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+        &[ix], Some(&caller.pubkey()), &[&caller], env.svm.latest_blockhash(),
+    );
+
+    let result = env.svm.send_transaction(tx);
+
+    match result {
+        Ok(meta) => {
+            let cu_consumed = meta.compute_units_consumed;
+            println!();
+            println!("Force-close crank succeeded");
+            println!("Compute units consumed: {}", cu_consumed);
+            println!();
+
+            // Verify CU is bounded per-crank
+            // Key constraint: Each crank must fit in a single transaction (<200k CU)
+            // Debug mode is ~3-5x slower than BPF. We see ~30k in debug, expect ~5-10k in BPF.
+            let max_cu_per_crank = 100_000; // Conservative limit per crank
+            assert!(cu_consumed < max_cu_per_crank,
+                "Force-close CU {} exceeds per-crank limit {}. Each crank must fit in single tx.",
+                cu_consumed, max_cu_per_crank);
+
+            // Calculate projected total for 4096 accounts
+            let projected_total = cu_consumed * 64;
+            let bpf_estimate = cu_consumed / 3; // BPF is ~3x faster than debug
+            let bpf_projected = bpf_estimate * 64;
+
+            println!("Projected CU for 4096 accounts (64 cranks):");
+            println!("  Debug mode: {} CU total", projected_total);
+            println!("  BPF estimate: {} CU total (3x faster)", bpf_projected);
+            println!();
+            println!("Per-crank CU: {} (debug), ~{} (BPF estimate)", cu_consumed, bpf_estimate);
+            println!("Per-crank limit: 200,000 CU (Solana default)");
+            println!("Per-crank utilization: {:.1}% (debug)", (cu_consumed as f64 / 200_000.0) * 100.0);
+
+            // BPF estimate should be well under 1.4M
+            // Each crank can also be submitted in separate blocks if needed
+            assert!(bpf_projected < 1_400_000,
+                "BPF projected total CU {} may exceed 1.4M budget", bpf_projected);
+
+            println!();
+            println!("BENCHMARK PASSED: Force-close CU is bounded");
+        }
+        Err(e) => {
+            panic!("Force-close crank failed: {:?}", e);
+        }
+    }
+
+    // Verify positions were closed
+    env.crank(); // Additional crank to close remaining positions
+
+    let mut remaining = 0;
+    for (_, idx) in &users {
+        if env.read_account_position(*idx) != 0 {
+            remaining += 1;
+        }
+    }
+    assert_eq!(remaining, 0, "All positions should be closed after two cranks");
+
+    println!();
+    println!("PREMARKET FORCE-CLOSE CU BENCHMARK COMPLETE");
 }

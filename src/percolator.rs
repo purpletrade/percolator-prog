@@ -1091,6 +1091,11 @@ pub mod ix {
         /// Set oracle price circuit breaker cap (admin only).
         /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
         SetOraclePriceCap { max_change_e2bps: u64 },
+        /// Resolve market: force-close all positions at admin oracle price, enter withdraw-only mode.
+        /// Admin only. Uses authority_price_e6 as settlement price.
+        ResolveMarket,
+        /// Withdraw insurance fund balance (admin only, requires RESOLVED flag).
+        WithdrawInsurance,
     }
 
     impl Instruction {
@@ -1212,6 +1217,8 @@ pub mod ix {
                     let max_change_e2bps = read_u64(&mut rest)?;
                     Ok(Instruction::SetOraclePriceCap { max_change_e2bps })
                 },
+                19 => Ok(Instruction::ResolveMarket),
+                20 => Ok(Instruction::WithdrawInsurance),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -1497,6 +1504,37 @@ pub mod state {
     /// Write accumulated dust (base token remainder) to _reserved[16..24].
     pub fn write_dust_base(data: &mut [u8], dust: u64) {
         data[RESERVED_OFF + 16..RESERVED_OFF + 24].copy_from_slice(&dust.to_le_bytes());
+    }
+
+    // ========================================
+    // Market Flags (stored in _padding[0] at offset 13)
+    // ========================================
+
+    /// Offset of flags byte in SlabHeader (_padding[0])
+    pub const FLAGS_OFF: usize = 13;
+
+    /// Flag bit: Market is resolved (withdraw-only mode)
+    pub const FLAG_RESOLVED: u8 = 1 << 0;
+
+    /// Read market flags from _padding[0].
+    pub fn read_flags(data: &[u8]) -> u8 {
+        data[FLAGS_OFF]
+    }
+
+    /// Write market flags to _padding[0].
+    pub fn write_flags(data: &mut [u8], flags: u8) {
+        data[FLAGS_OFF] = flags;
+    }
+
+    /// Check if market is resolved (withdraw-only mode).
+    pub fn is_resolved(data: &[u8]) -> bool {
+        read_flags(data) & FLAG_RESOLVED != 0
+    }
+
+    /// Set the resolved flag.
+    pub fn set_resolved(data: &mut [u8]) {
+        let flags = read_flags(data) | FLAG_RESOLVED;
+        write_flags(data, flags);
     }
 
     pub fn read_config(data: &[u8]) -> MarketConfig {
@@ -2430,6 +2468,11 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Block new users when market is resolved
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
@@ -2466,6 +2509,12 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Block new LPs when market is resolved
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
@@ -2503,6 +2552,12 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Block deposits when market is resolved
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
@@ -2637,6 +2692,53 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Check if market is resolved - if so, force-close positions instead of normal crank
+                if state::is_resolved(&data) {
+                    let config = state::read_config(&data);
+                    let settlement_price = config.authority_price_e6;
+                    if settlement_price == 0 {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+
+                    let clock = Clock::from_account_info(a_clock)?;
+                    let engine = zc::engine_mut(&mut data)?;
+
+                    // Force-close positions in a paginated manner using crank_cursor
+                    // Process up to 64 accounts per crank call (bounded compute)
+                    const BATCH_SIZE: u16 = 64;
+                    let start = engine.crank_cursor;
+                    let end = core::cmp::min(start + BATCH_SIZE, percolator::MAX_ACCOUNTS as u16);
+
+                    for idx in start..end {
+                        if engine.is_used(idx as usize) {
+                            let acc = &mut engine.accounts[idx as usize];
+                            let pos = acc.position_size.get();
+                            if pos != 0 {
+                                // Settle position at settlement price
+                                // PnL = position * (settlement_price - entry_price) / 1e6
+                                let entry = acc.entry_price as i128;
+                                let settle = settlement_price as i128;
+                                let pnl_delta = pos
+                                    .saturating_mul(settle.saturating_sub(entry))
+                                    / 1_000_000i128;
+
+                                // Add to PnL and clear position
+                                let old_pnl = acc.pnl.get();
+                                acc.pnl = percolator::I128::new(old_pnl.saturating_add(pnl_delta));
+                                acc.position_size = percolator::I128::ZERO;
+                                acc.entry_price = 0;
+                            }
+                        }
+                    }
+
+                    // Update crank cursor for next call
+                    engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 { 0 } else { end };
+                    engine.current_slot = clock.slot;
+
+                    return Ok(());
+                }
+
                 let mut config = state::read_config(&data);
                 let header = state::read_header(&data);
                 // Read last threshold update slot BEFORE mutable engine borrow
@@ -2826,7 +2928,7 @@ pub mod processor {
                 let a_user = &accounts[0];
                 let a_lp = &accounts[1];
                 let a_slab = &accounts[2];
-                
+
                 accounts::expect_signer(a_user)?;
                 accounts::expect_signer(a_lp)?;
                 accounts::expect_writable(a_slab)?;
@@ -2834,6 +2936,12 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Block trading when market is resolved
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 let mut config = state::read_config(&data);
 
                 let clock = Clock::from_account_info(&accounts[3])?;
@@ -2958,6 +3066,12 @@ pub mod processor {
                     let data = a_slab.try_borrow_data()?;
                     slab_guard(program_id, a_slab, &*data)?;
                     require_initialized(&*data)?;
+
+                    // Block trading when market is resolved
+                    if state::is_resolved(&*data) {
+                        return Err(ProgramError::InvalidAccountData);
+                    }
+
                     let config = state::read_config(&*data);
 
                     // Phase 3: Monotonic nonce for req_id (prevents replay attacks)
@@ -3272,6 +3386,12 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+
+                // Block insurance top-up when market is resolved
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
                 let config = state::read_config(&data);
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
@@ -3530,6 +3650,125 @@ pub mod processor {
                 let mut config = state::read_config(&data);
                 config.oracle_price_cap_e2bps = max_change_e2bps;
                 state::write_config(&mut data, &config);
+            }
+
+            Instruction::ResolveMarket => {
+                // Resolve market: set RESOLVED flag, use admin oracle price for settlement
+                // Positions are force-closed via subsequent KeeperCrank calls (paginated)
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Can't re-resolve
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Require admin oracle price to be set (authority_price_e6 > 0)
+                let config = state::read_config(&data);
+                if config.authority_price_e6 == 0 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Set the resolved flag
+                state::set_resolved(&mut data);
+            }
+
+            Instruction::WithdrawInsurance => {
+                // Withdraw insurance fund (admin only, requires RESOLVED and all positions closed)
+                accounts::expect_len(accounts, 6)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_admin_ata = &accounts[2];
+                let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+                let a_vault_pda = &accounts[5];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Must be resolved
+                if !state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_admin_ata, a_admin.key, &mint)?;
+                accounts::expect_key(a_vault_pda, &auth)?;
+
+                let engine = zc::engine_mut(&mut data)?;
+
+                // Require all positions to be closed (force-closed by crank)
+                // Check that no account has position_size != 0
+                let mut has_open_positions = false;
+                for i in 0..percolator::MAX_ACCOUNTS {
+                    if engine.is_used(i) {
+                        let pos = engine.accounts[i].position_size.get();
+                        if pos != 0 {
+                            has_open_positions = true;
+                            break;
+                        }
+                    }
+                }
+                if has_open_positions {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Get insurance balance and convert to base tokens
+                let insurance_units = engine.insurance_fund.balance.get();
+                if insurance_units == 0 {
+                    return Ok(()); // Nothing to withdraw
+                }
+
+                // Cap at u64::MAX for conversion (should never happen in practice)
+                let units_u64 = if insurance_units > u64::MAX as u128 {
+                    u64::MAX
+                } else {
+                    insurance_units as u64
+                };
+                let base_amount = crate::units::units_to_base(units_u64, config.unit_scale);
+
+                // Zero out insurance fund
+                engine.insurance_fund.balance = percolator::U128::ZERO;
+
+                // Transfer from vault to admin
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_admin_ata,
+                    a_vault_pda,
+                    base_amount,
+                    &signer_seeds,
+                )?;
             }
         }
         Ok(())
