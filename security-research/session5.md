@@ -587,6 +587,33 @@ The codebase continues to demonstrate strong security practices with comprehensi
 31. Risk reduction mode ✓
 32. Two-pass settlement (Finding G fix) ✓
 
+## Additional Deep Dive: TradeCpi Security ✓
+
+#### 45. TradeCpi Full Path ✓
+**Location**: `percolator-prog/src/percolator.rs:2899-3120`
+**Status**: SECURE
+
+Pre-CPI validation:
+- Account layout (8 accounts)
+- User signer, slab/matcher_ctx writable
+- Matcher shape (prog executable, ctx not, ctx owned by prog)
+- LP PDA derivation + shape (system-owned, empty, 0 lamports)
+- check_idx for LP and user
+- Owner authorization for both
+- Matcher identity binding (LP's registered matcher)
+
+CPI execution:
+- Slab NOT passed to CPI (prevents reentrancy)
+- LP PDA becomes signer via invoke_signed
+- Only passes lp_pda + matcher_ctx
+
+Post-CPI validation:
+- ABI validation: req_id, lp_account_id, oracle_price_e6 must match
+- exec_size used (not requested size) - Kani-proven
+- Risk reduction gate uses actual exec_size
+- State modified AFTER CPI returns
+- Nonce written AFTER execute_trade
+
 ## Known Open Issue
 
 **Bug #9**: Hyperp index smoothing bypass (clamp_toward_with_dt returns mark when dt=0)
