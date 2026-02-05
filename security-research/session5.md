@@ -3161,3 +3161,100 @@ The identified code patterns (aggregate updates before fallible operations) are 
 - Instruction failure reverts all state
 - No partial commits possible
 - Aggregate consistency guaranteed by runtime
+
+---
+
+## Session 18 (2026-02-05 - Warmup & Oracle Authority Edge Cases)
+
+### Warmup Period Edge Cases
+
+#### 215. Warmup Period Zero (Instant) ✓
+**Location**: `percolator/src/percolator.rs:2068-2077, 3191-3195`
+**Status**: SECURE
+
+When warmup_period_slots = 0:
+- slope = avail_gross (full availability instantly)
+- warmup_started_at_slot still updated
+- withdrawable_pnl returns min(avail, slope * elapsed) = full amount
+
+**Finding**: Instant warmup correctly handled
+
+#### 216. Warmup Slope Minimum of 1 ✓
+**Location**: `percolator/src/percolator.rs:2070-2071`
+**Status**: SECURE
+
+Code pattern:
+```rust
+if avail_gross > 0 {
+    core::cmp::max(1, base)
+}
+```
+
+Analysis:
+- Ensures slope >= 1 when PnL exists
+- Prevents "zero forever" zombie accounts
+- Debug assertion verifies invariant
+
+**Finding**: Warmup slope correctly bounded
+
+### Oracle Authority Edge Cases
+
+#### 217. Authority Price Clearing on Authority Change ✓
+**Location**: `percolator-prog/src/percolator.rs:3473-3475`
+**Status**: SECURE
+
+When SetOracleAuthority called:
+- authority_price_e6 = 0
+- authority_timestamp = 0
+- Prevents old authority's price from being used
+
+**Finding**: Price correctly cleared on authority transition
+
+#### 218. Authority Price Circuit Breaker ✓
+**Location**: `percolator-prog/src/percolator.rs:3505-3511`
+**Status**: SECURE
+
+PushOraclePrice flow:
+1. Validate signer == stored authority
+2. Clamp price via clamp_oracle_price
+3. Update both authority_price_e6 AND last_effective_price_e6
+
+**Finding**: Circuit breaker applies to authority prices
+
+#### 219. Authority Price Staleness Check ✓
+**Location**: `percolator-prog/src/percolator.rs:1858-1862`
+**Status**: SECURE
+
+read_authority_price validation:
+- Returns None if no authority set
+- Returns None if no price pushed yet
+- Returns None if age > max_staleness_secs
+- Returns None if age < 0 (future timestamp)
+
+**Finding**: Comprehensive staleness validation
+
+### Hyperp Mode Field Reuse
+
+#### 220. Authority Timestamp as Funding Rate ✓
+**Location**: `percolator-prog/src/percolator.rs:2395, 2686`
+**Status**: SECURE (Documented Design)
+
+In Hyperp mode:
+- authority_timestamp stores funding rate (i64 bps/slot)
+- is_hyperp_mode() guard isolates all access
+- Non-Hyperp: timestamp semantics
+- Hyperp: funding rate semantics
+
+**Finding**: Field reuse properly isolated by mode check
+
+## Session 18 Summary
+
+**Edge Cases Verified**: 6
+**Vulnerabilities Found**: 0
+
+Warmup and oracle authority systems are robust with:
+- Proper handling of period=0 (instant warmup)
+- Slope minimum prevents zombie accounts
+- Authority change clears stale prices
+- Circuit breaker applies to all price sources
+- Hyperp mode safely reuses fields with proper isolation
