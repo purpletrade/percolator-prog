@@ -2838,3 +2838,118 @@ All tested combination attacks and edge cases are properly defended through:
 - Solana transaction atomicity
 - Economic disincentives
 - Defense-in-depth design
+
+---
+
+## Session 15 (2026-02-05 - Deep Dive Attack Hypotheses)
+
+### Explored Attack Vectors
+
+#### 197. Multi-Transaction State Persistence Attack ✓
+**Hypothesis**: Can cross-transaction state gaps (crank vs sweep timing) be exploited?
+**Status**: SECURE
+
+Analysis:
+- Both `require_fresh_crank` and `require_recent_full_sweep` use same `max_crank_staleness_slots`
+- Risk-increasing operations require BOTH checks to pass
+- Sweep START triggers immediate priority liquidations
+- No timing gap exploitable due to double gate defense
+
+**Finding**: Double timing gate prevents exploitation
+
+#### 198. Fee Rounding Accumulation Attack ✓
+**Hypothesis**: Can ceiling division in funding/fees accumulate exploitable rounding errors?
+**Status**: SECURE (Conservative Design)
+
+Analysis:
+- Payers round UP: `(raw + 999_999) / 1_000_000`
+- Receivers truncate (floor): `raw / 1_000_000`
+- Net effect: System DEFLATES slightly (never inflates)
+- Lost rounding goes nowhere (pure friction, not insurance)
+- Prevents inflation attacks, not exploitable in reverse
+
+**Finding**: Conservative rounding is intentional, not exploitable
+
+#### 199. Reserved PnL Manipulation Attack ✓
+**Hypothesis**: Can reserved_pnl field be manipulated to affect warmup/withdrawal?
+**Status**: NOT APPLICABLE
+
+Analysis:
+- `reserved_pnl` is initialized to 0 on account creation
+- No production code path modifies reserved_pnl
+- Field appears to be stub for future withdrawal reservation feature
+- All subtractions effectively no-ops (0 - 0)
+
+**Finding**: Field unused in production, no attack surface
+
+#### 200. Self-Liquidation Profit Attack ✓
+**Hypothesis**: Can an attacker profit by controlling both liquidated account and liquidator?
+**Status**: NOT PROFITABLE
+
+Analysis:
+- Liquidation is permissionless (anyone can liquidate underwater accounts)
+- Liquidation fee goes to INSURANCE FUND, not liquidator
+- Liquidator receives NO reward
+- Position closed at oracle price (no arbitrage)
+- Attacker would lose capital with no gain
+
+**Finding**: No MEV extraction possible from liquidation
+
+#### 201. LP Concentration DOS Attack ✓
+**Hypothesis**: Can sole LP refuse fills to grief users?
+**Status**: DESIGN LIMITATION (Not Protocol Bug)
+
+Analysis:
+- LP controls their matcher (can set max_fill_abs = 0)
+- If sole LP, market has no liquidity
+- This is a market structure issue, not protocol vulnerability
+- Multiple LPs and permissionless entry mitigate
+- Protocol correctly handles zero-fill as no-op
+
+**Finding**: Market design issue, not security vulnerability
+
+#### 202. Insurance Fund Drainage via Force-Realize ✓
+**Hypothesis**: Can attacker accelerate insurance drain by forcing bad positions?
+**Status**: SECURE (By Design)
+
+Analysis:
+- Insurance decreases when positions are force-realized at loss
+- Force-realize only activates when insurance <= threshold
+- Attacker would need to BE the losing position (lose own capital)
+- Economic disincentive: attacker loses more than they could extract
+- Haircut protects remaining positive PnL holders
+
+**Finding**: Attacking insurance requires losing capital
+
+#### 203. Account Index Reuse Attack ✓
+**Hypothesis**: Can GC + new account cause accounting confusion via index reuse?
+**Status**: SECURE
+
+Analysis:
+- Account indices CAN be reused after GC
+- BUT account_id is unique and monotonically increasing
+- All cross-references use account_id, not slot index
+- LP registration stores account_id for matching
+- No confusion possible due to unique IDs
+
+**Finding**: Unique account_id prevents confusion
+
+### Test Infrastructure Fix
+
+Fixed integration tests for updated percolator-match ABI:
+- Matcher init now requires LP PDA as first account
+- Updated all 10 failing tests to pass correct accounts
+- All 57 tests now pass
+
+## Session 15 Summary
+
+**Novel Hypotheses Tested**: 7
+**Vulnerabilities Found**: 0
+**Design Limitations Documented**: 1 (LP concentration)
+
+All explored attack vectors are properly defended through:
+- Double timing gates (crank + sweep)
+- Conservative rounding (deflation not inflation)
+- Unique account IDs (no index reuse confusion)
+- Economic disincentives (attacker loses capital)
+- Permissionless design (no extraction from liquidation)
