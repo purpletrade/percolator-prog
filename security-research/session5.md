@@ -1101,3 +1101,46 @@ The Percolator codebase demonstrates excellent security practices across all rev
 - Subtracted from positive PnL to get available gross
 - Must be 0 for GC (prevents closing with reserved funds)
 - u64 type matches on-chain layout
+
+#### 84. Pyth Oracle Parsing ✓
+**Location**: `percolator-prog/src/percolator.rs:1615-1698`
+**Status**: SECURE
+
+- Owner validation (PYTH_RECEIVER_PROGRAM_ID)
+- Length check >= 134 bytes
+- feed_id validation
+- price > 0 check
+- Exponent bounded (MAX_EXPO_ABS)
+- Staleness check (disabled on devnet)
+- Confidence check (disabled on devnet)
+- Overflow check in multiplication
+
+#### 85. Chainlink Oracle Parsing ✓
+**Location**: `percolator-prog/src/percolator.rs:1710-1787`
+**Status**: SECURE
+
+- Owner validation (CHAINLINK_OCR2_PROGRAM_ID)
+- Feed pubkey validation
+- Length check >= 224 bytes
+- answer > 0 check
+- decimals bounded (MAX_EXPO_ABS)
+- Staleness check (disabled on devnet)
+- Overflow check in multiplication
+
+#### 86. Authority Oracle (Admin Push) ✓
+**Location**: `percolator-prog/src/percolator.rs:1840-1864`
+**Status**: SECURE
+
+- Returns None if no authority set
+- Returns None if price not pushed
+- Staleness check (age > max_staleness_secs)
+- Price cleared on authority change (SetOracleAuthority)
+
+## Session 6 Summary
+
+**Total Areas Verified This Session**: 86
+**Bug #9 Fixed**: Yes (clamp_toward_with_dt now returns index when dt=0)
+**New Vulnerabilities Found**: 0
+**All 57 Integration Tests**: PASS
+
+The codebase continues to demonstrate robust security practices. All identified areas have been verified as secure, with comprehensive input validation, overflow protection, and proper authorization checks throughout.
