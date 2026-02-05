@@ -3660,12 +3660,136 @@ Race condition and cross-instruction attacks comprehensively mitigated by:
 
 ---
 
-## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-21)
+## Session 22: Solana-Specific Attack Vectors
+
+**Date**: 2026-02-05
+**Focus**: Rent exemption, CU exhaustion, lamport manipulation, sysvar attacks
+
+#### 247. Rent Exemption Protection ✓
+**Location**: `percolator-prog/src/percolator.rs:3353-3367` (CloseSlab)
+**Status**: SECURE
+
+Attack: Drain lamports to make accounts non-rent-exempt.
+
+Defenses:
+- Slab: Fixed size SLAB_LEN (~992KB), program-owned
+- Vault: SPL token account (165 bytes), spl_token owned
+- LP PDA: Must have lamports_zero (line 2948)
+- CloseSlab: Validates complete state before closing
+
+**Finding**: No mechanism to drain lamports from functional accounts
+
+#### 248. Compute Unit Management ✓
+**Location**: `percolator-prog/src/percolator.rs:2352, 3370`
+**Status**: SECURE (Bounded Costs)
+
+Attack: CU exhaustion via excessive computation.
+
+Analysis:
+- InitMarket: Zeros full slab (~194K CU, bounded by SLAB_LEN)
+- CloseSlab: Zeros slab (same cost)
+- Engine ops: O(1) with pre-aggregated LP states
+- No unbounded loops
+
+**Risk**: `unsafe_close` feature skips zeroing - NEVER deploy
+
+#### 249. Account Data Size Limits ✓
+**Location**: `percolator-prog/src/percolator.rs:22-32`
+**Status**: SECURE
+
+Attack: State growth beyond limits.
+
+Defenses:
+- Slab: Fixed at SLAB_LEN (cannot grow)
+- MAX_ACCOUNTS: Bounded at 4096
+- check_idx: Validates `idx < MAX_ACCOUNTS`
+- No reallocation mechanism
+
+**Finding**: Fixed sizes prevent state growth attacks
+
+#### 250. Lamport Manipulation ✓
+**Location**: `percolator-prog/src/percolator.rs:3375-3381`
+**Status**: SECURE
+
+Attack: Lamport overflow or unauthorized transfer.
+
+Defenses:
+- LP PDA: lamports_zero validation (line 2948)
+- CloseSlab: Uses checked_add for lamport transfer
+- Source zeroed before destination addition
+- All token transfers via SPL token program
+
+**Finding**: Checked arithmetic prevents overflow
+
+#### 251. Program Upgrade Protection ✓
+**Status**: DEPLOYMENT-DEPENDENT
+
+Analysis:
+- No upgrade instruction in program
+- Uses declare_id! with hardcoded address
+- Security depends on BPF deployment configuration
+
+**Requirement**: Burn upgrade authority on mainnet deployment
+
+#### 252. Sysvar Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2362` (Clock)
+**Status**: SECURE (with caveats)
+
+Attack: Sysvar manipulation via clock.
+
+Defenses:
+- Clock::from_account_info() relies on Solana runtime
+- Rate-limited to 1 year of slots (~31.5M) for dt
+- Slot regression gives dt=0 (saturating_sub)
+
+**Risk**: `devnet` feature disables oracle staleness checks - NEVER deploy
+
+#### 253. Account Owner Spoofing ✓
+**Location**: `percolator-prog/src/percolator.rs:234-235`
+**Status**: SECURE (Kani-verified)
+
+Attack: Bypass owner checks.
+
+Defenses:
+- verify::owner_ok: Non-zero AND exact match
+- Zero-address bypass explicitly rejected
+- LP PDA: Must be system-owned (line 2946)
+- Vault: Must be spl_token owned
+- Oracle: Owner-based feed type detection
+
+**Finding**: Multi-layer owner validation, formally verified
+
+#### 254. Transaction Size Limits ✓
+**Status**: SECURE (Solana Runtime)
+
+Analysis:
+- CPI requires 8 accounts (well within 128 limit)
+- Instruction data lengths validated
+- Slab NOT passed to matcher CPI
+- Transaction size limited by Solana runtime (1232 bytes)
+
+**Finding**: Program works within Solana constraints
+
+## Session 22 Summary
+
+**Solana-Specific Attack Vectors Analyzed**: 8
+**Critical Vulnerabilities Found**: 0
+**Deployment Requirements Identified**: 2
+
+Key findings:
+1. Fixed account sizes prevent state growth
+2. Checked arithmetic prevents lamport overflow
+3. Owner validation is Kani-verified
+4. **CRITICAL**: Never deploy with `devnet` or `unsafe_close` features
+
+---
+
+## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-22)
 
 ### Final Statistics
 
-**Total Sessions**: 17 (Sessions 5-21)
-**Total Areas Verified**: 246
+**Total Sessions**: 18 (Sessions 5-22)
+**Total Areas Verified**: 254
 **Critical Vulnerabilities Found**: 0
 **Open Issues**: 0
 
@@ -3688,13 +3812,14 @@ Race condition and cross-instruction attacks comprehensively mitigated by:
 | Novel Attack Vectors | 20+ | ✓ TESTED |
 | Dust/Edge Cases | 8 | ✓ VERIFIED |
 | Cross-Instruction/Race | 12 | ✓ VERIFIED |
+| Solana-Specific | 8 | ✓ VERIFIED |
 
 ### Verification Methods
 
 - 271 Kani formal proofs
 - 57 integration tests (all pass)
 - 21 proptest fuzzing tests
-- Manual code review (246 areas)
+- Manual code review (254 areas)
 - Novel attack hypothesis testing (20+ vectors)
 
 ### Conclusion
