@@ -54,6 +54,7 @@ use percolator_prog::verify::{
     init_market_scale_ok,
 };
 use percolator_prog::constants::MAX_UNIT_SCALE;
+use percolator_prog::oracle::clamp_toward_with_dt;
 
 // Kani-specific bounds to avoid SAT explosion on division/modulo.
 // MAX_UNIT_SCALE (1 billion) is too large for bit-precise SAT solving.
@@ -2849,3 +2850,100 @@ fn kani_scale_price_e6_concrete_example() {
 // boundaries, but this is unavoidable with integer arithmetic and economically
 // insignificant compared to the original bug (factor of unit_scale difference).
 
+// =============================================================================
+// BUG #9 RATE LIMITING PROOFS (clamp_toward_with_dt)
+// =============================================================================
+//
+// Bug #9: In Hyperp mode, clamp_toward_with_dt originally returned `mark` when
+// dt=0 (same slot), allowing double-crank to bypass rate limiting.
+// Fix: Return `index` (no movement) when dt=0 or cap=0.
+
+/// Prove: When dt_slots == 0, index is returned unchanged (no movement).
+/// This is the core Bug #9 fix - prevents same-slot rate limit bypass.
+#[kani::proof]
+fn kani_clamp_toward_no_movement_when_dt_zero() {
+    let index: u64 = kani::any();
+    let mark: u64 = kani::any();
+    let cap_e2bps: u64 = kani::any();
+
+    // Constrain to valid inputs
+    kani::assume(index > 0);  // index=0 is special case (returns mark)
+    kani::assume(cap_e2bps > 0);  // cap=0 also returns index unchanged
+
+    // dt_slots = 0 (same slot)
+    let result = clamp_toward_with_dt(index, mark, cap_e2bps, 0);
+
+    // Bug #9 fix: must return index, NOT mark
+    assert_eq!(result, index,
+        "clamp_toward_with_dt must return index unchanged when dt_slots=0");
+}
+
+/// Prove: When cap_e2bps == 0, index is returned unchanged (rate limiting disabled).
+#[kani::proof]
+fn kani_clamp_toward_no_movement_when_cap_zero() {
+    let index: u64 = kani::any();
+    let mark: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+
+    // Constrain to valid inputs
+    kani::assume(index > 0);  // index=0 is special case
+    kani::assume(dt_slots > 0);  // dt=0 also returns index unchanged
+
+    // cap_e2bps = 0 (rate limiting disabled)
+    let result = clamp_toward_with_dt(index, mark, 0, dt_slots);
+
+    assert_eq!(result, index,
+        "clamp_toward_with_dt must return index unchanged when cap_e2bps=0");
+}
+
+/// Prove: When index == 0 (uninitialized), mark is returned (bootstrap case).
+#[kani::proof]
+fn kani_clamp_toward_bootstrap_when_index_zero() {
+    let mark: u64 = kani::any();
+    let cap_e2bps: u64 = kani::any();
+    let dt_slots: u64 = kani::any();
+
+    // index = 0 is the bootstrap/initialization case
+    let result = clamp_toward_with_dt(0, mark, cap_e2bps, dt_slots);
+
+    assert_eq!(result, mark,
+        "clamp_toward_with_dt must return mark when index=0 (bootstrap)");
+}
+
+/// Prove: Index movement is bounded - concrete example.
+/// Uses fixed values to avoid SAT explosion from division.
+#[kani::proof]
+fn kani_clamp_toward_movement_bounded_concrete() {
+    // Concrete example: index=1_000_000, cap=10_000 (1%), dt=1
+    // max_delta = 1_000_000 * 10_000 * 1 / 1_000_000 = 10_000
+    let index: u64 = 1_000_000;
+    let cap_e2bps: u64 = 10_000;  // 1%
+    let dt_slots: u64 = 1;
+    let mark: u64 = kani::any();
+
+    let result = clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots);
+
+    // max_delta = 10_000
+    let lo = index - 10_000;  // 990_000
+    let hi = index + 10_000;  // 1_010_000
+
+    assert!(result >= lo && result <= hi,
+        "result must be within 1% of index");
+}
+
+/// Prove: Formula correctness - concrete example.
+/// Uses fixed values to avoid SAT explosion from division.
+#[kani::proof]
+fn kani_clamp_toward_formula_concrete() {
+    // Same concrete setup
+    let index: u64 = 1_000_000;
+    let cap_e2bps: u64 = 10_000;  // 1%
+    let dt_slots: u64 = 1;
+    let mark: u64 = kani::any();
+
+    let result = clamp_toward_with_dt(index, mark, cap_e2bps, dt_slots);
+    let expected = mark.clamp(990_000, 1_010_000);
+
+    assert_eq!(result, expected,
+        "result must equal mark.clamp(990_000, 1_010_000)");
+}
