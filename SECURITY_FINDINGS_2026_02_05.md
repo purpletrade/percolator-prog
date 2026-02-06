@@ -241,42 +241,29 @@ No exploitable vulnerabilities found in this deep dive.
 
 The `percolator-prog/tests/kani.rs` file contains 146 Kani proofs. Analysis reveals that approximately 10-12 proofs are vacuous or trivially true, while ~135 provide real verification value.
 
-### Category 1: Vacuous Proofs (Fix Required)
+### Category 1: Vacuous Proofs - **ALL FIXED**
 
-**1.1 `kani_unit_conversion_deterministic` (lines 2703-2720)**
-- **Issue**: Copies result instead of re-calling function
-- **Code**: `let (units2, dust2) = (units1, dust1);` (line 2716)
-- **Effect**: Proves `units1 == units1` - completely meaningless
-- **Fix**: Change to `let (units2, dust2) = base_to_units(base, scale);`
+**1.1 `kani_unit_conversion_deterministic`** - FIXED (commit 18d658e)
+- Now calls `base_to_units` twice instead of copying result
 
-**1.2 `kani_reject_has_no_chosen_size` (lines 1514-1528)**
-- **Issue**: Structural tautology - asserts `true` on enum match
-- **Code**: `assert!(true, "Reject has no chosen_size by construction");`
-- **Effect**: The match itself proves the structural property; assertion adds nothing
-- **Fix**: Either remove (enum structure is self-evident) or use `kani::cover!()` for coverage
+**1.2 `kani_reject_has_no_chosen_size`** - REMOVED
+- Structural property enforced by Rust type system, no proof needed
 
-### Category 2: Identity Function Proofs (Low Value)
+### Category 2: Identity Function Proofs - **REMOVED**
 
-These test trivial wrapper functions that return their input unchanged:
+Removed 4 trivial proofs that tested identity functions:
+- `kani_signer_ok_true/false` - `signer_ok(b) -> b` is identity
+- `kani_writable_ok_true/false` - `writable_ok(b) -> b` is identity
 
-| Proof | Function | Tests |
-|-------|----------|-------|
-| `kani_signer_ok_true` | `signer_ok(b) -> b` | `true == true` |
-| `kani_signer_ok_false` | `signer_ok(b) -> b` | `!false` |
-| `kani_writable_ok_true` | `writable_ok(b) -> b` | `true == true` |
-| `kani_writable_ok_false` | `writable_ok(b) -> b` | `!false` |
+Consolidated `len_ok` tests into single universal proof: `kani_len_ok_universal`
 
-**Verdict**: While not technically incorrect, these prove nothing useful.
+### Category 3: Fake Non-Interference - **REMOVED**
 
-### Category 3: Fake Non-Interference (Trivially True)
+Removed 2 trivial proofs:
+- `kani_admin_ok_independent_of_scale`
+- `kani_owner_ok_independent_of_scale`
 
-**3.1 `kani_admin_ok_independent_of_scale` (lines 2661-2675)**
-**3.2 `kani_owner_ok_independent_of_scale` (lines 2679-2698)**
-
-- **Issue**: Functions don't share any state - independence is trivially true
-- `admin_ok` compares `[u8; 32]` arrays, doesn't use `unit_scale`
-- `owner_ok` compares `[u8; 32]` arrays, doesn't use `unit_scale`
-- **Effect**: Proves that unrelated functions are unrelated
+Independence is structural (no shared state), not a runtime property
 
 ### Category 4: Bounded Coverage (Documented Limitation)
 
@@ -304,10 +291,12 @@ The remaining ~135 proofs provide real verification value:
 | Unit conversion math | 12 | Division correctness, dust handling |
 | Oracle inversion | 8 | Price scaling, identity properties |
 
-### Recommendations
+### Recommendations - Status
 
-1. **Fix `kani_unit_conversion_deterministic`**: Re-call `base_to_units` instead of copying
-2. **Remove identity proofs**: `signer_ok_*`, `writable_ok_*` test trivial wrappers
-3. **Remove fake non-interference proofs**: Independence is structural, not semantic
-4. **Document bounded coverage**: Add note that full-range testing relies on proptest/fuzzing
-5. **Consider `kani::cover!()`**: For structural properties, coverage is more meaningful than assertion
+1. ~~**Fix `kani_unit_conversion_deterministic`**~~ - **DONE** (commit 18d658e)
+2. ~~**Remove identity proofs**~~ - **DONE** (this commit)
+3. ~~**Remove fake non-interference proofs**~~ - **DONE** (this commit)
+4. **Document bounded coverage**: Full-range testing relies on proptest/fuzzing ✓
+5. **Aggregate inductive proofs**: Implement PROOFS_PLAN.md for Bug #10 class (future work)
+
+**Proof count reduced**: 146 → 138 (removed 8 trivial proofs)

@@ -1138,46 +1138,20 @@ fn kani_tradecpi_any_accept_increments_nonce() {
 }
 
 // =============================================================================
-// Q. ACCOUNT VALIDATION HELPERS (6 proofs)
+// Q. ACCOUNT VALIDATION HELPERS (2 proofs)
 // =============================================================================
+// Note: signer_ok and writable_ok are identity functions (return input unchanged).
+// Testing them would be trivial (proving true==true). Only len_ok has real logic.
 
-/// Prove: signer_ok reflects is_signer truthfully
+/// Prove: len_ok requires actual >= need (universal)
 #[kani::proof]
-fn kani_signer_ok_true() {
-    assert!(signer_ok(true), "signer_ok(true) must be true");
-}
-
-#[kani::proof]
-fn kani_signer_ok_false() {
-    assert!(!signer_ok(false), "signer_ok(false) must be false");
-}
-
-/// Prove: writable_ok reflects is_writable truthfully
-#[kani::proof]
-fn kani_writable_ok_true() {
-    assert!(writable_ok(true), "writable_ok(true) must be true");
-}
-
-#[kani::proof]
-fn kani_writable_ok_false() {
-    assert!(!writable_ok(false), "writable_ok(false) must be false");
-}
-
-/// Prove: len_ok requires actual >= need
-#[kani::proof]
-fn kani_len_ok_sufficient() {
+fn kani_len_ok_universal() {
     let actual: usize = kani::any();
     let need: usize = kani::any();
-    kani::assume(actual >= need);
-    assert!(len_ok(actual, need), "len_ok must pass when actual >= need");
-}
 
-#[kani::proof]
-fn kani_len_ok_insufficient() {
-    let actual: usize = kani::any();
-    let need: usize = kani::any();
-    kani::assume(actual < need);
-    assert!(!len_ok(actual, need), "len_ok must fail when actual < need");
+    // Universal proof: len_ok returns true iff actual >= need
+    assert_eq!(len_ok(actual, need), actual >= need,
+        "len_ok must return (actual >= need)");
 }
 
 // =============================================================================
@@ -1506,26 +1480,11 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
 }
 
 // =============================================================================
-// W. REJECT => NO CHOSEN_SIZE (1 proof)
+// W. REJECT => NO CHOSEN_SIZE
 // =============================================================================
-
-/// Prove: Reject decision has no chosen_size field (structural guarantee)
-#[kani::proof]
-fn kani_reject_has_no_chosen_size() {
-    let decision = TradeCpiDecision::Reject;
-
-    // This is a structural proof - Reject variant has no chosen_size field
-    // The match below proves that Reject cannot carry a chosen_size
-    match decision {
-        TradeCpiDecision::Reject => {
-            // Reject has no fields - chosen_size is not accessible
-            assert!(true, "Reject has no chosen_size by construction");
-        }
-        TradeCpiDecision::Accept { chosen_size: _, new_nonce: _ } => {
-            panic!("expected Reject, got Accept");
-        }
-    }
-}
+// Note: Removed trivial proof. The Reject variant having no fields is a
+// compile-time structural guarantee enforced by Rust's type system.
+// A Kani proof asserting `true` on enum match adds no verification value.
 
 // =============================================================================
 // X. i128::MIN BOUNDARY REGRESSION (1 proof)
@@ -2651,51 +2610,11 @@ fn kani_init_market_scale_valid_range() {
 }
 
 // =============================================================================
-// AL. NON-INTERFERENCE PROOFS (4 proofs)
-// Prove scaling functions are independent of security-critical decisions
+// AL. NON-INTERFERENCE PROOFS
 // =============================================================================
-
-/// Prove: admin_ok is independent of unit_scale
-/// Changing scale doesn't affect admin authorization
-#[kani::proof]
-fn kani_admin_ok_independent_of_scale() {
-    let admin: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    let scale1: u32 = kani::any();
-    let scale2: u32 = kani::any();
-
-    // Regardless of scale choice, admin_ok gives same result
-    let result1 = admin_ok(admin, signer);
-    // Simulate "using" scale (it has no effect on admin_ok)
-    let _ = init_market_scale_ok(scale1);
-    let _ = init_market_scale_ok(scale2);
-    let result2 = admin_ok(admin, signer);
-
-    assert_eq!(result1, result2, "admin_ok must not depend on scale");
-}
-
-/// Prove: owner_ok is independent of unit_scale
-#[kani::proof]
-fn kani_owner_ok_independent_of_scale() {
-    let stored: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    let scale: u32 = kani::any();
-    kani::assume(scale <= KANI_MAX_SCALE);
-
-    // owner_ok doesn't use scale at all
-    let result = owner_ok(stored, signer);
-
-    // unit scale operations are completely separate (use bounded base)
-    let base: u64 = kani::any();
-    kani::assume(base <= (scale.max(1) as u64) * KANI_MAX_QUOTIENT);
-    let (units, dust) = base_to_units(base, scale);
-    let _ = units_to_base(units, scale);
-    let _ = dust;
-
-    // Re-check owner_ok - same result
-    assert_eq!(result, owner_ok(stored, signer),
-        "owner_ok must not depend on scale operations");
-}
+// Note: Removed trivial proofs. admin_ok and owner_ok compare [u8; 32] arrays
+// and don't reference unit_scale at all. Independence is structural (no shared
+// state), not a runtime property that needs formal verification.
 
 /// Prove: unit conversion is deterministic - same inputs always give same outputs
 /// Calls the function twice with the same inputs to verify identical results.
