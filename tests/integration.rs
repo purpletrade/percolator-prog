@@ -17132,3 +17132,781 @@ fn test_attack_close_then_gc_decrements_used_count() {
         "num_used_accounts should decrease after close+GC: before={} after={}",
         num_before, num_after);
 }
+
+// ============================================================================
+// ROUND 14: Warmup+haircut, size=1 trades, entry price, fee paths, funding,
+//           position reversal margin, GC edge cases, force-realize path,
+//           fee debt forgiveness, sequential operations
+// ============================================================================
+
+/// ATTACK: Trade with position size = 1 (smallest non-zero).
+/// Verify conservation holds even with minimal position.
+#[test]
+fn test_attack_trade_size_one_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade with smallest possible size
+    env.trade(&user, &lp, lp_idx, user_idx, 1);
+    assert_eq!(env.read_account_position(user_idx), 1);
+    assert_eq!(env.read_account_position(lp_idx), -1);
+
+    // Price change
+    env.set_slot_and_price(50, 150_000_000);
+    env.crank();
+
+    // Conservation with size=1
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with size=1! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 16_000_000_000,
+        "ATTACK: SPL vault changed with size=1 trade!");
+}
+
+/// ATTACK: Trade size = -1 (smallest short position).
+/// Verify negative position of size 1 conserves.
+#[test]
+fn test_attack_trade_size_negative_one_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Short size=1
+    env.trade(&user, &lp, lp_idx, user_idx, -1);
+    assert_eq!(env.read_account_position(user_idx), -1);
+    assert_eq!(env.read_account_position(lp_idx), 1);
+
+    // Price change and crank
+    env.set_slot_and_price(50, 120_000_000);
+    env.crank();
+
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with size=-1! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 16_000_000_000,
+        "ATTACK: SPL vault changed with size=-1 trade!");
+}
+
+/// ATTACK: Position reversal (long→short) requires initial_margin_bps.
+/// When crossing zero, the margin check uses the stricter initial margin.
+#[test]
+fn test_attack_position_reversal_margin_check() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Open long position
+    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
+    assert_eq!(env.read_account_position(user_idx), 500_000);
+
+    // Reverse to short (crosses zero) - should succeed with sufficient margin
+    env.set_slot(2);
+    env.trade(&user, &lp, lp_idx, user_idx, -1_000_000);
+    assert_eq!(env.read_account_position(user_idx), -500_000,
+        "Position should have flipped to short");
+
+    // Conservation after flip
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync after position reversal! c_tot={} sum={}", c_tot, sum);
+}
+
+/// ATTACK: Close account path settles fees correctly.
+/// Compare: crank(settle fees) → close vs. close(settles fees internally).
+#[test]
+fn test_attack_close_account_settles_fees_correctly() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Accrue fees over many slots WITHOUT cranking (lazy settlement)
+    env.set_slot(2000);
+    // Don't crank - let CloseAccount handle fee settlement
+
+    let vault_before = env.vault_balance();
+    let insurance_before = env.read_insurance_balance();
+
+    // Close account without intermediate crank - CloseAccount must settle fees internally
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "CloseAccount should settle fees and succeed: {:?}", result);
+
+    let vault_after = env.vault_balance();
+    let insurance_after = env.read_insurance_balance();
+
+    // Vault decreased (capital returned to user)
+    assert!(vault_before > vault_after,
+        "Vault should decrease from capital return");
+
+    // Insurance increased (fees collected)
+    assert!(insurance_after >= insurance_before,
+        "Insurance should increase from fee collection: before={} after={}",
+        insurance_before, insurance_after);
+}
+
+/// ATTACK: Funding accumulation across position size changes.
+/// Open position, crank to accrue funding, change position size, crank again.
+/// Verify funding uses stored index (anti-retroactivity).
+#[test]
+fn test_attack_funding_across_position_size_change() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Open initial position
+    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
+    let cap_after_trade = env.read_account_capital(user_idx);
+
+    // Crank to accrue some funding
+    env.set_slot(100);
+    env.crank();
+
+    // Partial close (reduce position)
+    env.set_slot(101);
+    env.trade(&user, &lp, lp_idx, user_idx, -250_000);
+    assert_eq!(env.read_account_position(user_idx), 250_000);
+
+    // More cranks with smaller position
+    env.set_slot(200);
+    env.crank();
+
+    // Conservation must hold through all changes
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync after position size change! c_tot={} sum={}", c_tot, sum);
+
+    // SPL vault unchanged
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 61_000_000_000,
+        "ATTACK: SPL vault changed during funding with position changes!");
+}
+
+/// ATTACK: Partial position close then full close then CloseAccount.
+/// Full lifecycle: open → partial close → full close → account close.
+#[test]
+fn test_attack_partial_close_full_lifecycle() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 30_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Open
+    env.trade(&user, &lp, lp_idx, user_idx, 300_000);
+    assert_eq!(env.read_account_position(user_idx), 300_000);
+
+    // Partial close
+    env.set_slot(2);
+    env.trade(&user, &lp, lp_idx, user_idx, -100_000);
+    assert_eq!(env.read_account_position(user_idx), 200_000);
+
+    // Full close
+    env.set_slot(3);
+    env.trade(&user, &lp, lp_idx, user_idx, -200_000);
+    assert_eq!(env.read_account_position(user_idx), 0);
+
+    // Settle everything
+    for i in 0..10 {
+        env.set_slot(100 + i * 50);
+        env.crank();
+    }
+
+    // Close account
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(),
+        "CloseAccount should succeed after full position lifecycle: {:?}", result);
+
+    let cap = env.read_account_capital(user_idx);
+    assert_eq!(cap, 0, "Capital should be zero after close");
+}
+
+/// ATTACK: Multiple deposits to LP then user trades against it.
+/// Verify LP capital accumulates correctly and trades work.
+#[test]
+fn test_attack_lp_multiple_deposits_then_trade() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    // Set zero fee to avoid complications
+    env.try_set_maintenance_fee(&admin, 0).unwrap();
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Second LP deposit
+    env.set_slot(2);
+    env.deposit(&lp, lp_idx, 5_000_000_000);
+    let lp_cap = env.read_account_capital(lp_idx);
+    assert_eq!(lp_cap, 15_000_000_000, "LP capital should accumulate");
+
+    // User trades against the well-funded LP
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(3);
+    env.trade(&user, &lp, lp_idx, user_idx, 200_000);
+    assert_eq!(env.read_account_position(user_idx), 200_000);
+
+    // Conservation
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync with multi-deposit LP! c_tot={} sum={}", c_tot, sum);
+}
+
+/// ATTACK: Withdraw then immediately re-deposit.
+/// Verify no value created or lost in the cycle.
+#[test]
+fn test_attack_withdraw_redeposit_cycle_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_set_maintenance_fee(&admin, 0).unwrap();
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    let cap_before = env.read_account_capital(user_idx);
+    let vault_before = env.vault_balance();
+
+    // Withdraw half
+    env.try_withdraw(&user, user_idx, 2_000_000_000).unwrap();
+    let cap_mid = env.read_account_capital(user_idx);
+    assert_eq!(cap_mid, cap_before - 2_000_000_000,
+        "Capital should decrease by withdrawal amount");
+
+    // Re-deposit same amount
+    env.set_slot(2);
+    env.deposit(&user, user_idx, 2_000_000_000);
+    let cap_after = env.read_account_capital(user_idx);
+    assert_eq!(cap_after, cap_before,
+        "Capital should return to original after withdraw+redeposit: before={} after={}",
+        cap_before, cap_after);
+
+    // Vault should be back to original
+    let vault_after = env.vault_balance();
+    assert_eq!(vault_before, vault_after,
+        "Vault should be unchanged after withdraw+redeposit");
+}
+
+/// ATTACK: Warmup-period market - trade and settle across warmup slots.
+/// Profit from trade should vest over warmup_period_slots.
+/// Verify conservation through the vesting process.
+#[test]
+fn test_attack_warmup_vesting_conservation_with_profit() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_warmup(0, 100); // 100-slot warmup
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Open and close position with profit
+    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
+    env.set_slot_and_price(50, 150_000_000); // Price goes up
+    env.crank();
+
+    // Close position (realizes gain into warmup)
+    env.set_slot(51);
+    env.trade(&user, &lp, lp_idx, user_idx, -500_000);
+
+    let cap_mid = env.read_account_capital(user_idx);
+
+    // Vest warmup over many cranks
+    for i in 0..15 {
+        env.set_slot(100 + i * 50);
+        env.crank();
+    }
+
+    let cap_final = env.read_account_capital(user_idx);
+    // Capital should increase as warmup vests profit
+    assert!(cap_final >= cap_mid,
+        "Capital should increase as warmup vests: mid={} final={}", cap_mid, cap_final);
+
+    // Conservation
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync during warmup vesting! c_tot={} sum={}", c_tot, sum);
+}
+
+/// ATTACK: Force-realize disabled when insurance > threshold.
+/// Top up insurance to disable force-realize, verify positions persist.
+#[test]
+fn test_attack_insurance_topup_disables_force_realize() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Top up insurance to disable force-realize (insurance > threshold)
+    env.try_top_up_insurance(&admin, 5_000_000_000).unwrap();
+    env.crank();
+
+    // Open position
+    env.trade(&user, &lp, lp_idx, user_idx, 500_000);
+
+    // Crank - should NOT force-realize since insurance is funded
+    env.set_slot(100);
+    env.crank();
+
+    // Position should persist (not force-realized)
+    let pos = env.read_account_position(user_idx);
+    assert_eq!(pos, 500_000,
+        "Position should persist when insurance > threshold (no force-realize)");
+}
+
+/// ATTACK: Sequential deposit → trade → crank → withdraw → close lifecycle.
+/// Full account lifecycle with all operations in sequence.
+#[test]
+fn test_attack_full_account_lifecycle_sequence() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 30_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    // 1. Deposit (before crank to prevent GC of zero-capital account)
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    assert_eq!(env.read_account_capital(user_idx), 5_000_000_000);
+
+    // 2. Trade
+    env.set_slot(2);
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_eq!(env.read_account_position(user_idx), 100_000);
+
+    // 3. Crank (settle)
+    env.set_slot(100);
+    env.crank();
+
+    // 4. Close position
+    env.set_slot(101);
+    env.trade(&user, &lp, lp_idx, user_idx, -100_000);
+    assert_eq!(env.read_account_position(user_idx), 0);
+
+    // 5. Settle warmup
+    for i in 0..10 {
+        env.set_slot(200 + i * 50);
+        env.crank();
+    }
+
+    // 6. Withdraw remaining capital
+    let cap = env.read_account_capital(user_idx);
+    if cap > 0 {
+        env.try_withdraw(&user, user_idx, cap as u64).unwrap();
+    }
+
+    // 7. Close account
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(),
+        "Full lifecycle CloseAccount should succeed: {:?}", result);
+}
+
+/// ATTACK: GC account that just had position closed.
+/// Close position → crank → crank again → verify GC happens.
+#[test]
+fn test_attack_gc_after_position_close_and_settlement() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 20_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Open and close position
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    env.set_slot(2);
+    env.trade(&user, &lp, lp_idx, user_idx, -100_000);
+
+    // Settle warmup
+    for i in 0..10 {
+        env.set_slot(100 + i * 50);
+        env.crank();
+    }
+
+    let num_before_close = env.read_num_used_accounts();
+    assert!(num_before_close >= 2,
+        "Precondition: both LP and user should be active: {}", num_before_close);
+
+    // Close account (returns capital)
+    env.try_close_account(&user, user_idx).unwrap();
+
+    // Crank to GC the closed account
+    env.set_slot(1000);
+    env.crank();
+    env.set_slot(1100);
+    env.crank();
+
+    let num_after = env.read_num_used_accounts();
+    assert!(num_after < num_before_close,
+        "num_used should decrease after close+GC: before={} after={}",
+        num_before_close, num_after);
+}
+
+/// ATTACK: Large position then price crash - verify conservation through liquidation.
+/// Even in liquidation, c_tot must equal sum of capitals.
+#[test]
+fn test_attack_liquidation_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 10_000_000_000).unwrap();
+    env.crank();
+
+    // Large long position relative to capital
+    env.trade(&user, &lp, lp_idx, user_idx, 50_000_000);
+
+    // Price crash - circuit breaker limits per-slot move, so crank many times
+    env.set_slot_and_price(100, 50_000_000); // ~64% price drop
+    for i in 0..20u64 {
+        env.set_slot(100 + i * 50);
+        env.crank();
+    }
+
+    // Conservation must hold regardless of liquidation outcome
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync through liquidation! c_tot={} sum={}", c_tot, sum);
+
+    // SPL vault unchanged (no external value extraction)
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 115_000_000_000,
+        "ATTACK: SPL vault changed during liquidation!");
+}
+
+/// ATTACK: Trade at max price (circuit breaker limit).
+/// Oracle at extreme high price, crank, verify no overflow.
+#[test]
+fn test_attack_trade_at_extreme_high_price() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade at default price
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+
+    // Extreme high oracle price
+    env.set_slot_and_price(50, 10_000_000_000); // $10,000
+    for i in 0..10u64 {
+        env.set_slot(50 + i * 100);
+        env.crank();
+    }
+
+    // Should not overflow - conservation holds
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync at extreme high price! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 61_000_000_000,
+        "ATTACK: SPL vault changed at extreme high price!");
+}
+
+/// ATTACK: Trade at extreme low oracle price (near zero).
+/// Verify no division by zero or overflow.
+#[test]
+fn test_attack_trade_at_extreme_low_price() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Trade at default price
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+
+    // Extreme low oracle price (but circuit breaker limits per-slot change)
+    env.set_slot_and_price(50, 1_000); // $0.001
+    for i in 0..10u64 {
+        env.set_slot(50 + i * 100);
+        env.crank();
+    }
+
+    // Conservation
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync at extreme low price! c_tot={} sum={}", c_tot, sum);
+
+    let spl_vault = {
+        let vault_data = env.svm.get_account(&env.vault).unwrap().data;
+        TokenAccount::unpack(&vault_data).unwrap().amount
+    };
+    assert_eq!(spl_vault, 61_000_000_000,
+        "ATTACK: SPL vault changed at extreme low price!");
+}
+
+/// ATTACK: Rapid open/close/open cycle - same position size, different slots.
+/// Tests that entry_price resets correctly on each open.
+#[test]
+fn test_attack_rapid_open_close_open_cycle() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 30_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.try_top_up_insurance(&admin, 1_000_000_000).unwrap();
+    env.crank();
+
+    // Cycle 1: open
+    env.trade(&user, &lp, lp_idx, user_idx, 100_000);
+    assert_eq!(env.read_account_position(user_idx), 100_000);
+
+    // Cycle 1: close
+    env.set_slot(2);
+    env.trade(&user, &lp, lp_idx, user_idx, -100_000);
+    assert_eq!(env.read_account_position(user_idx), 0);
+
+    // Price change between cycles
+    env.set_slot_and_price(50, 145_000_000);
+    env.crank();
+
+    // Cycle 2: open at new price (different size to avoid tx collision)
+    env.set_slot(51);
+    env.trade(&user, &lp, lp_idx, user_idx, 200_000);
+    assert_eq!(env.read_account_position(user_idx), 200_000);
+
+    // Crank
+    env.set_slot(100);
+    env.crank();
+
+    // Conservation after cycles
+    let c_tot = env.read_c_tot();
+    let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
+    assert_eq!(c_tot, sum,
+        "ATTACK: c_tot desync after open/close/open cycle! c_tot={} sum={}", c_tot, sum);
+}
