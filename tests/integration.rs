@@ -23096,3 +23096,174 @@ fn test_admin_force_close_account_enables_close_slab() {
     println!("ADMIN FORCE CLOSE ACCOUNT ENABLES CLOSE SLAB: PASSED");
 }
 
+/// Test: Honest user with positive PnL can close account after force-close + warmup.
+/// Force-close crank initializes warmup slope so settle_warmup_to_capital can convert
+/// PnL to capital over the warmup period.
+#[test]
+fn test_honest_user_close_after_force_close_positive_pnl() {
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found");
+        return;
+    };
+
+    env.init_market_hyperp(1_000_000); // mark = 1.0
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.set_slot(100);
+    env.crank();
+
+    // User buys
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 500_000_000, &mp, &matcher_ctx).unwrap();
+
+    // Price doubles → user profits
+    let _ = env.try_push_oracle_price(&admin, 2_000_000, 2000);
+    env.try_resolve_market(&admin).unwrap();
+
+    // Force-close positions via crank
+    env.set_slot(200);
+    env.crank();
+
+    let pnl_after = env.read_account_pnl(user_idx);
+    let cap_after = env.read_account_capital(user_idx);
+    println!("After force-close: user PnL={}, capital={}", pnl_after, cap_after);
+    assert!(pnl_after > 0, "User should have positive PnL from price increase");
+
+    // CloseAccount immediately — may fail if warmup period > 0
+    let result = env.try_close_account(&user, user_idx);
+    if result.is_err() {
+        // Wait for warmup period to elapse and retry
+        env.set_slot(10_000);
+        let result2 = env.try_close_account(&user, user_idx);
+        assert!(result2.is_ok(), "User should close after warmup elapses: {:?}", result2);
+        println!("User closed after warmup period");
+    } else {
+        println!("User closed immediately (warmup period = 0 or instant)");
+    }
+
+    println!("HONEST USER CLOSE AFTER FORCE-CLOSE POSITIVE PNL: PASSED");
+}
+
+/// Test: Honest user with negative PnL can close account immediately after force-close.
+/// Negative PnL is settled immediately (deducted from capital), no warmup needed.
+#[test]
+fn test_honest_user_close_after_force_close_negative_pnl() {
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found");
+        return;
+    };
+
+    env.init_market_hyperp(1_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let _ = env.try_push_oracle_price(&admin, 2_000_000, 1000);
+    env.set_slot(100);
+    env.crank();
+
+    // User buys at 2.0
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 500_000_000, &mp, &matcher_ctx).unwrap();
+
+    // Price drops to 1.0 → user loses
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 2000);
+    env.try_resolve_market(&admin).unwrap();
+
+    env.set_slot(200);
+    env.crank();
+
+    let pnl_after = env.read_account_pnl(user_idx);
+    println!("After force-close: user PnL={}", pnl_after);
+
+    // Close should work immediately (negative PnL settled instantly)
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "Losing user should close immediately: {:?}", result);
+
+    println!("HONEST USER CLOSE AFTER FORCE-CLOSE NEGATIVE PNL: PASSED");
+}
+
+/// Test: Both LP and user can close after force-close (full lifecycle for honest participants)
+#[test]
+fn test_honest_participants_full_lifecycle() {
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found");
+        return;
+    };
+
+    env.init_market_hyperp(1_000_000);
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.set_slot(100);
+    env.crank();
+
+    // Trade: user buys, LP sells
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 500_000_000, &mp, &matcher_ctx).unwrap();
+
+    let vault_before = env.vault_balance();
+    println!("Vault before resolution: {}", vault_before);
+
+    // Resolve at same price — PnL should be ~0 for both
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 2000);
+    env.try_resolve_market(&admin).unwrap();
+
+    env.set_slot(200);
+    env.crank();
+
+    let user_pnl = env.read_account_pnl(user_idx);
+    let lp_pnl = env.read_account_pnl(lp_idx);
+    println!("After force-close: user PnL={}, LP PnL={}", user_pnl, lp_pnl);
+
+    // Wait for warmup in case either has positive PnL
+    env.set_slot(10_000);
+
+    // Both should be able to close
+    let user_result = env.try_close_account(&user, user_idx);
+    assert!(user_result.is_ok(), "User should close: {:?}", user_result);
+
+    let lp_result = env.try_close_account(&lp, lp_idx);
+    assert!(lp_result.is_ok(), "LP should close: {:?}", lp_result);
+
+    let used = env.read_num_used_accounts();
+    assert_eq!(used, 0, "All accounts should be closed");
+
+    // Withdraw insurance and close slab
+    let insurance = env.read_insurance_balance();
+    if insurance > 0 {
+        env.try_withdraw_insurance(&admin).unwrap();
+    }
+    env.svm.expire_blockhash();
+    let result = env.try_close_slab();
+    assert!(result.is_ok(), "CloseSlab should succeed: {:?}", result);
+
+    println!("HONEST PARTICIPANTS FULL LIFECYCLE: PASSED");
+}
+

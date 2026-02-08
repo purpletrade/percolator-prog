@@ -2737,6 +2737,26 @@ pub mod processor {
                                 let new_pnl = old_pnl.saturating_add(pnl_delta);
                                 engine.set_pnl(idx as usize, new_pnl);
 
+                                // Initialize warmup slope for positive PnL so users can
+                                // close accounts via CloseAccount after warmup elapses.
+                                // Without this, warmup_slope_per_step stays 0 and
+                                // settle_warmup_to_capital converts nothing (Bug #11).
+                                if new_pnl > 0 {
+                                    let avail = (new_pnl as u128).saturating_sub(
+                                        engine.accounts[idx as usize].reserved_pnl as u128
+                                    );
+                                    let period = engine.params.warmup_period_slots as u128;
+                                    let slope = if period > 0 {
+                                        core::cmp::max(1u128, avail / period)
+                                    } else {
+                                        avail // instant warmup
+                                    };
+                                    engine.accounts[idx as usize].warmup_slope_per_step =
+                                        percolator::U128::new(slope);
+                                    engine.accounts[idx as usize].warmup_started_at_slot =
+                                        clock.slot;
+                                }
+
                                 // Clear position
                                 engine.accounts[idx as usize].position_size = percolator::I128::ZERO;
                                 engine.accounts[idx as usize].entry_price = 0;
