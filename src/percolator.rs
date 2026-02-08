@@ -5,15 +5,15 @@
 
 extern crate alloc;
 
-use solana_program::pubkey::Pubkey;
 use solana_program::declare_id;
+use solana_program::pubkey::Pubkey;
 
 declare_id!("Perco1ator111111111111111111111111111111111");
 
 // 1. mod constants
 pub mod constants {
-    use core::mem::{size_of, align_of};
-    use crate::state::{SlabHeader, MarketConfig};
+    use crate::state::{MarketConfig, SlabHeader};
+    use core::mem::{align_of, size_of};
     use percolator::RiskEngine;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
@@ -45,12 +45,12 @@ pub mod constants {
     pub const MAX_UNIT_SCALE: u32 = 1_000_000_000;
 
     // Default funding parameters (used at init_market, can be changed via update_config)
-    pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500;            // ~4 min @ ~2 slots/sec
-    pub const DEFAULT_FUNDING_K_BPS: u64 = 100;                    // 1.00x multiplier
+    pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500; // ~4 min @ ~2 slots/sec
+    pub const DEFAULT_FUNDING_K_BPS: u64 = 100; // 1.00x multiplier
     pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // Funding scale factor (e6 units)
-    pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500;          // cap premium at 5.00%
-    pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5;           // cap per-slot funding
-    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000;       // 1% per slot max price change for Hyperp
+    pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500; // cap premium at 5.00%
+    pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5; // cap per-slot funding
+    pub const DEFAULT_HYPERP_PRICE_CAP_E2BPS: u64 = 10_000; // 1% per slot max price change for Hyperp
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
@@ -80,10 +80,10 @@ pub mod constants {
 
     // Default threshold parameters (used at init_market, can be changed via update_config)
     pub const DEFAULT_THRESH_FLOOR: u128 = 0;
-    pub const DEFAULT_THRESH_RISK_BPS: u64 = 50;              // 0.50%
+    pub const DEFAULT_THRESH_RISK_BPS: u64 = 50; // 0.50%
     pub const DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS: u64 = 10;
-    pub const DEFAULT_THRESH_STEP_BPS: u64 = 500;             // 5% max step
-    pub const DEFAULT_THRESH_ALPHA_BPS: u64 = 1000;           // 10% EWMA
+    pub const DEFAULT_THRESH_STEP_BPS: u64 = 500; // 5% max step
+    pub const DEFAULT_THRESH_ALPHA_BPS: u64 = 1000; // 10% EWMA
     pub const DEFAULT_THRESH_MIN: u128 = 0;
     pub const DEFAULT_THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
     pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
@@ -126,10 +126,14 @@ impl LpRiskState {
 
         // Guard: old_lp_abs must be part of sum_abs (caller must use same engine snapshot)
         #[cfg(debug_assertions)]
-        debug_assert!(self.sum_abs >= old_lp_abs, "old_lp_abs not in sum_abs - wrong engine snapshot?");
+        debug_assert!(
+            self.sum_abs >= old_lp_abs,
+            "old_lp_abs not in sum_abs - wrong engine snapshot?"
+        );
 
         // Update sum_abs in O(1)
-        let new_sum_abs = self.sum_abs
+        let new_sum_abs = self
+            .sum_abs
             .saturating_sub(old_lp_abs)
             .saturating_add(new_lp_abs);
 
@@ -192,9 +196,8 @@ pub fn compute_inventory_funding_bps_per_slot(
     let notional_e6: u128 = abs_pos.saturating_mul(price_e6 as u128) / 1_000_000u128;
 
     // premium_bps = (notional / scale) * k_bps, capped
-    let mut premium_bps_u: u128 = notional_e6
-        .saturating_mul(funding_k_bps as u128)
-        / funding_inv_scale_notional_e6.max(1);
+    let mut premium_bps_u: u128 =
+        notional_e6.saturating_mul(funding_k_bps as u128) / funding_inv_scale_notional_e6.max(1);
 
     if premium_bps_u > (funding_max_premium_bps.unsigned_abs() as u128) {
         premium_bps_u = funding_max_premium_bps.unsigned_abs() as u128;
@@ -214,8 +217,12 @@ pub fn compute_inventory_funding_bps_per_slot(
     per_slot = per_slot.clamp(-10_000, 10_000);
 
     // Policy clamp: tighter bound per config
-    if per_slot > funding_max_bps_per_slot { per_slot = funding_max_bps_per_slot; }
-    if per_slot < -funding_max_bps_per_slot { per_slot = -funding_max_bps_per_slot; }
+    if per_slot > funding_max_bps_per_slot {
+        per_slot = funding_max_bps_per_slot;
+    }
+    if per_slot < -funding_max_bps_per_slot {
+        per_slot = -funding_max_bps_per_slot;
+    }
     per_slot
 }
 
@@ -520,7 +527,8 @@ pub mod verify {
             expected_oracle_price_e6,
             req_size,
             expected_req_id,
-        ).is_ok()
+        )
+        .is_ok()
     }
 
     /// Decision function for TradeCpi that computes ABI validity from real inputs.
@@ -813,16 +821,15 @@ pub mod verify {
     pub fn init_market_scale_ok(unit_scale: u32) -> bool {
         unit_scale <= crate::constants::MAX_UNIT_SCALE
     }
-
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
 #[allow(unsafe_code)]
 pub mod zc {
-    use solana_program::program_error::ProgramError;
-    use percolator::RiskEngine;
-    use crate::constants::{ENGINE_OFF, ENGINE_LEN, ENGINE_ALIGN};
+    use crate::constants::{ENGINE_ALIGN, ENGINE_LEN, ENGINE_OFF};
     use core::mem::offset_of;
+    use percolator::RiskEngine;
+    use solana_program::program_error::ProgramError;
 
     // Use const to export the actual offset for debugging
     pub const ACCOUNTS_OFFSET: usize = offset_of!(RiskEngine, accounts);
@@ -862,8 +869,7 @@ pub mod zc {
     // Use engine_mut() + init_in_place() instead for initialization.
 
     use solana_program::{
-        account_info::AccountInfo,
-        instruction::Instruction as SolInstruction,
+        account_info::AccountInfo, instruction::Instruction as SolInstruction,
         program::invoke_signed,
     };
 
@@ -892,13 +898,13 @@ pub mod zc {
 }
 
 pub mod matcher_abi {
-    use solana_program::program_error::ProgramError;
     use crate::constants::MATCHER_ABI_VERSION;
+    use solana_program::program_error::ProgramError;
 
     /// Matcher return flags
-    pub const FLAG_VALID: u32 = 1;       // bit0: response is valid
-    pub const FLAG_PARTIAL_OK: u32 = 2;  // bit1: partial fill including zero allowed
-    pub const FLAG_REJECTED: u32 = 4;    // bit2: trade rejected by matcher
+    pub const FLAG_VALID: u32 = 1; // bit0: response is valid
+    pub const FLAG_PARTIAL_OK: u32 = 2; // bit1: partial fill including zero allowed
+    pub const FLAG_REJECTED: u32 = 4; // bit2: trade rejected by matcher
 
     #[repr(C)]
     #[derive(Debug, Clone, Copy)]
@@ -914,7 +920,9 @@ pub mod matcher_abi {
     }
 
     pub fn read_matcher_return(ctx: &[u8]) -> Result<MatcherReturn, ProgramError> {
-        if ctx.len() < 64 { return Err(ProgramError::InvalidAccountData); }
+        if ctx.len() < 64 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let abi_version = u32::from_le_bytes(ctx[0..4].try_into().unwrap());
         let flags = u32::from_le_bytes(ctx[4..8].try_into().unwrap());
         let exec_price_e6 = u64::from_le_bytes(ctx[8..16].try_into().unwrap());
@@ -925,26 +933,55 @@ pub mod matcher_abi {
         let reserved = u64::from_le_bytes(ctx[56..64].try_into().unwrap());
 
         Ok(MatcherReturn {
-            abi_version, flags, exec_price_e6, exec_size, req_id, lp_account_id, oracle_price_e6, reserved
+            abi_version,
+            flags,
+            exec_price_e6,
+            exec_size,
+            req_id,
+            lp_account_id,
+            oracle_price_e6,
+            reserved,
         })
     }
 
-    pub fn validate_matcher_return(ret: &MatcherReturn, lp_account_id: u64, oracle_price_e6: u64, req_size: i128, req_id: u64) -> Result<(), ProgramError> {
+    pub fn validate_matcher_return(
+        ret: &MatcherReturn,
+        lp_account_id: u64,
+        oracle_price_e6: u64,
+        req_size: i128,
+        req_id: u64,
+    ) -> Result<(), ProgramError> {
         // Check ABI version
-        if ret.abi_version != MATCHER_ABI_VERSION { return Err(ProgramError::InvalidAccountData); }
+        if ret.abi_version != MATCHER_ABI_VERSION {
+            return Err(ProgramError::InvalidAccountData);
+        }
         // Must have VALID flag set
-        if (ret.flags & FLAG_VALID) == 0 { return Err(ProgramError::InvalidAccountData); }
+        if (ret.flags & FLAG_VALID) == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         // Must not have REJECTED flag set
-        if (ret.flags & FLAG_REJECTED) != 0 { return Err(ProgramError::InvalidAccountData); }
+        if (ret.flags & FLAG_REJECTED) != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
 
         // Validate echoed fields match request
-        if ret.lp_account_id != lp_account_id { return Err(ProgramError::InvalidAccountData); }
-        if ret.oracle_price_e6 != oracle_price_e6 { return Err(ProgramError::InvalidAccountData); }
-        if ret.reserved != 0 { return Err(ProgramError::InvalidAccountData); }
-        if ret.req_id != req_id { return Err(ProgramError::InvalidAccountData); }
+        if ret.lp_account_id != lp_account_id {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if ret.oracle_price_e6 != oracle_price_e6 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if ret.reserved != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if ret.req_id != req_id {
+            return Err(ProgramError::InvalidAccountData);
+        }
 
         // Require exec_price_e6 != 0 always - avoids "all zeros but valid flag" ambiguity
-        if ret.exec_price_e6 == 0 { return Err(ProgramError::InvalidAccountData); }
+        if ret.exec_price_e6 == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
 
         // Zero exec_size requires PARTIAL_OK flag
         if ret.exec_size == 0 {
@@ -956,9 +993,13 @@ pub mod matcher_abi {
         }
 
         // Size constraints (use unsigned_abs to avoid i128::MIN overflow)
-        if ret.exec_size.unsigned_abs() > req_size.unsigned_abs() { return Err(ProgramError::InvalidAccountData); }
+        if ret.exec_size.unsigned_abs() > req_size.unsigned_abs() {
+            return Err(ProgramError::InvalidAccountData);
+        }
         if req_size != 0 {
-            if ret.exec_size.signum() != req_size.signum() { return Err(ProgramError::InvalidAccountData); }
+            if ret.exec_size.signum() != req_size.signum() {
+                return Err(ProgramError::InvalidAccountData);
+            }
         }
         Ok(())
     }
@@ -966,8 +1007,8 @@ pub mod matcher_abi {
 
 // 3. mod error
 pub mod error {
-    use solana_program::program_error::ProgramError;
     use percolator::RiskError;
+    use solana_program::program_error::ProgramError;
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum PercolatorError {
@@ -1026,8 +1067,8 @@ pub mod error {
 
 // 4. mod ix
 pub mod ix {
-    use solana_program::{pubkey::Pubkey, program_error::ProgramError};
     use percolator::{RiskParams, U128};
+    use solana_program::{program_error::ProgramError, pubkey::Pubkey};
 
     #[derive(Debug)]
     pub enum Instruction {
@@ -1048,18 +1089,51 @@ pub mod ix {
             initial_mark_price_e6: u64,
             risk_params: RiskParams,
         },
-        InitUser { fee_payment: u64 },
-        InitLP { matcher_program: Pubkey, matcher_context: Pubkey, fee_payment: u64 },
-        DepositCollateral { user_idx: u16, amount: u64 },
-        WithdrawCollateral { user_idx: u16, amount: u64 },
-        KeeperCrank { caller_idx: u16, allow_panic: u8 },
-        TradeNoCpi { lp_idx: u16, user_idx: u16, size: i128 },
-        LiquidateAtOracle { target_idx: u16 },
-        CloseAccount { user_idx: u16 },
-        TopUpInsurance { amount: u64 },
-        TradeCpi { lp_idx: u16, user_idx: u16, size: i128 },
-        SetRiskThreshold { new_threshold: u128 },
-        UpdateAdmin { new_admin: Pubkey },
+        InitUser {
+            fee_payment: u64,
+        },
+        InitLP {
+            matcher_program: Pubkey,
+            matcher_context: Pubkey,
+            fee_payment: u64,
+        },
+        DepositCollateral {
+            user_idx: u16,
+            amount: u64,
+        },
+        WithdrawCollateral {
+            user_idx: u16,
+            amount: u64,
+        },
+        KeeperCrank {
+            caller_idx: u16,
+            allow_panic: u8,
+        },
+        TradeNoCpi {
+            lp_idx: u16,
+            user_idx: u16,
+            size: i128,
+        },
+        LiquidateAtOracle {
+            target_idx: u16,
+        },
+        CloseAccount {
+            user_idx: u16,
+        },
+        TopUpInsurance {
+            amount: u64,
+        },
+        TradeCpi {
+            lp_idx: u16,
+            user_idx: u16,
+            size: i128,
+        },
+        SetRiskThreshold {
+            new_threshold: u128,
+        },
+        UpdateAdmin {
+            new_admin: Pubkey,
+        },
         /// Close the market slab and recover SOL to admin.
         /// Requires: no active accounts, no vault funds, no insurance funds.
         CloseSlab,
@@ -1080,17 +1154,26 @@ pub mod ix {
             thresh_min_step: u128,
         },
         /// Set maintenance fee per slot (admin only)
-        SetMaintenanceFee { new_fee: u128 },
+        SetMaintenanceFee {
+            new_fee: u128,
+        },
         /// Set the oracle price authority (admin only).
         /// Authority can push prices instead of requiring Pyth/Chainlink.
         /// Pass zero pubkey to disable and require Pyth/Chainlink.
-        SetOracleAuthority { new_authority: Pubkey },
+        SetOracleAuthority {
+            new_authority: Pubkey,
+        },
         /// Push oracle price (oracle authority only).
         /// Stores the price for use by crank/trade operations.
-        PushOraclePrice { price_e6: u64, timestamp: i64 },
+        PushOraclePrice {
+            price_e6: u64,
+            timestamp: i64,
+        },
         /// Set oracle price circuit breaker cap (admin only).
         /// max_change_e2bps in 0.01 bps units (1_000_000 = 100%). 0 = disabled.
-        SetOraclePriceCap { max_change_e2bps: u64 },
+        SetOraclePriceCap {
+            max_change_e2bps: u64,
+        },
         /// Resolve market: force-close all positions at admin oracle price, enter withdraw-only mode.
         /// Admin only. Uses authority_price_e6 as settlement price.
         ResolveMarket,
@@ -1098,15 +1181,20 @@ pub mod ix {
         WithdrawInsurance,
         /// Admin force-close an abandoned account after market resolution.
         /// Requires RESOLVED flag, zero position, admin signer.
-        AdminForceCloseAccount { user_idx: u16 },
+        AdminForceCloseAccount {
+            user_idx: u16,
+        },
     }
 
     impl Instruction {
         pub fn decode(input: &[u8]) -> Result<Self, ProgramError> {
-            let (&tag, mut rest) = input.split_first().ok_or(ProgramError::InvalidInstructionData)?;
-            
+            let (&tag, mut rest) = input
+                .split_first()
+                .ok_or(ProgramError::InvalidInstructionData)?;
+
             match tag {
-                0 => { // InitMarket
+                0 => {
+                    // InitMarket
                     let admin = read_pubkey(&mut rest)?;
                     let collateral_mint = read_pubkey(&mut rest)?;
                     let index_feed_id = read_bytes32(&mut rest)?;
@@ -1117,72 +1205,107 @@ pub mod ix {
                     let initial_mark_price_e6 = read_u64(&mut rest)?;
                     let risk_params = read_risk_params(&mut rest)?;
                     Ok(Instruction::InitMarket {
-                        admin, collateral_mint, index_feed_id,
-                        max_staleness_secs, conf_filter_bps, invert, unit_scale,
-                        initial_mark_price_e6, risk_params
+                        admin,
+                        collateral_mint,
+                        index_feed_id,
+                        max_staleness_secs,
+                        conf_filter_bps,
+                        invert,
+                        unit_scale,
+                        initial_mark_price_e6,
+                        risk_params,
                     })
-                },
-                1 => { // InitUser
+                }
+                1 => {
+                    // InitUser
                     let fee_payment = read_u64(&mut rest)?;
                     Ok(Instruction::InitUser { fee_payment })
-                },
-                2 => { // InitLP
+                }
+                2 => {
+                    // InitLP
                     let matcher_program = read_pubkey(&mut rest)?;
                     let matcher_context = read_pubkey(&mut rest)?;
                     let fee_payment = read_u64(&mut rest)?;
-                    Ok(Instruction::InitLP { matcher_program, matcher_context, fee_payment })
-                },
-                3 => { // Deposit
+                    Ok(Instruction::InitLP {
+                        matcher_program,
+                        matcher_context,
+                        fee_payment,
+                    })
+                }
+                3 => {
+                    // Deposit
                     let user_idx = read_u16(&mut rest)?;
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::DepositCollateral { user_idx, amount })
-                },
-                4 => { // Withdraw
+                }
+                4 => {
+                    // Withdraw
                     let user_idx = read_u16(&mut rest)?;
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::WithdrawCollateral { user_idx, amount })
-                },
-                5 => { // KeeperCrank
+                }
+                5 => {
+                    // KeeperCrank
                     let caller_idx = read_u16(&mut rest)?;
                     let allow_panic = read_u8(&mut rest)?;
-                    Ok(Instruction::KeeperCrank { caller_idx, allow_panic })
-                },
-                6 => { // TradeNoCpi
+                    Ok(Instruction::KeeperCrank {
+                        caller_idx,
+                        allow_panic,
+                    })
+                }
+                6 => {
+                    // TradeNoCpi
                     let lp_idx = read_u16(&mut rest)?;
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
-                    Ok(Instruction::TradeNoCpi { lp_idx, user_idx, size })
-                },
-                7 => { // LiquidateAtOracle
+                    Ok(Instruction::TradeNoCpi {
+                        lp_idx,
+                        user_idx,
+                        size,
+                    })
+                }
+                7 => {
+                    // LiquidateAtOracle
                     let target_idx = read_u16(&mut rest)?;
                     Ok(Instruction::LiquidateAtOracle { target_idx })
-                },
-                8 => { // CloseAccount
+                }
+                8 => {
+                    // CloseAccount
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::CloseAccount { user_idx })
-                },
-                9 => { // TopUpInsurance
+                }
+                9 => {
+                    // TopUpInsurance
                     let amount = read_u64(&mut rest)?;
                     Ok(Instruction::TopUpInsurance { amount })
-                },
-                10 => { // TradeCpi
+                }
+                10 => {
+                    // TradeCpi
                     let lp_idx = read_u16(&mut rest)?;
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
-                    Ok(Instruction::TradeCpi { lp_idx, user_idx, size })
-                },
-                11 => { // SetRiskThreshold
+                    Ok(Instruction::TradeCpi {
+                        lp_idx,
+                        user_idx,
+                        size,
+                    })
+                }
+                11 => {
+                    // SetRiskThreshold
                     let new_threshold = read_u128(&mut rest)?;
                     Ok(Instruction::SetRiskThreshold { new_threshold })
-                },
-                12 => { // UpdateAdmin
+                }
+                12 => {
+                    // UpdateAdmin
                     let new_admin = read_pubkey(&mut rest)?;
                     Ok(Instruction::UpdateAdmin { new_admin })
-                },
-                13 => { // CloseSlab
+                }
+                13 => {
+                    // CloseSlab
                     Ok(Instruction::CloseSlab)
-                },
-                14 => { // UpdateConfig
+                }
+                14 => {
+                    // UpdateConfig
                     let funding_horizon_slots = read_u64(&mut rest)?;
                     let funding_k_bps = read_u64(&mut rest)?;
                     let funding_inv_scale_notional_e6 = read_u128(&mut rest)?;
@@ -1197,97 +1320,131 @@ pub mod ix {
                     let thresh_max = read_u128(&mut rest)?;
                     let thresh_min_step = read_u128(&mut rest)?;
                     Ok(Instruction::UpdateConfig {
-                        funding_horizon_slots, funding_k_bps, funding_inv_scale_notional_e6,
-                        funding_max_premium_bps, funding_max_bps_per_slot,
-                        thresh_floor, thresh_risk_bps, thresh_update_interval_slots,
-                        thresh_step_bps, thresh_alpha_bps, thresh_min, thresh_max, thresh_min_step,
+                        funding_horizon_slots,
+                        funding_k_bps,
+                        funding_inv_scale_notional_e6,
+                        funding_max_premium_bps,
+                        funding_max_bps_per_slot,
+                        thresh_floor,
+                        thresh_risk_bps,
+                        thresh_update_interval_slots,
+                        thresh_step_bps,
+                        thresh_alpha_bps,
+                        thresh_min,
+                        thresh_max,
+                        thresh_min_step,
                     })
-                },
-                15 => { // SetMaintenanceFee
+                }
+                15 => {
+                    // SetMaintenanceFee
                     let new_fee = read_u128(&mut rest)?;
                     Ok(Instruction::SetMaintenanceFee { new_fee })
-                },
-                16 => { // SetOracleAuthority
+                }
+                16 => {
+                    // SetOracleAuthority
                     let new_authority = read_pubkey(&mut rest)?;
                     Ok(Instruction::SetOracleAuthority { new_authority })
-                },
-                17 => { // PushOraclePrice
+                }
+                17 => {
+                    // PushOraclePrice
                     let price_e6 = read_u64(&mut rest)?;
                     let timestamp = read_i64(&mut rest)?;
-                    Ok(Instruction::PushOraclePrice { price_e6, timestamp })
-                },
-                18 => { // SetOraclePriceCap
+                    Ok(Instruction::PushOraclePrice {
+                        price_e6,
+                        timestamp,
+                    })
+                }
+                18 => {
+                    // SetOraclePriceCap
                     let max_change_e2bps = read_u64(&mut rest)?;
                     Ok(Instruction::SetOraclePriceCap { max_change_e2bps })
-                },
+                }
                 19 => Ok(Instruction::ResolveMarket),
                 20 => Ok(Instruction::WithdrawInsurance),
                 21 => {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::AdminForceCloseAccount { user_idx })
-                },
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
     }
 
     fn read_u8(input: &mut &[u8]) -> Result<u8, ProgramError> {
-        let (&val, rest) = input.split_first().ok_or(ProgramError::InvalidInstructionData)?;
+        let (&val, rest) = input
+            .split_first()
+            .ok_or(ProgramError::InvalidInstructionData)?;
         *input = rest;
         Ok(val)
     }
 
     fn read_u16(input: &mut &[u8]) -> Result<u16, ProgramError> {
-        if input.len() < 2 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 2 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(2);
         *input = rest;
         Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_u32(input: &mut &[u8]) -> Result<u32, ProgramError> {
-        if input.len() < 4 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 4 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(4);
         *input = rest;
         Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_u64(input: &mut &[u8]) -> Result<u64, ProgramError> {
-        if input.len() < 8 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 8 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(8);
         *input = rest;
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_i64(input: &mut &[u8]) -> Result<i64, ProgramError> {
-        if input.len() < 8 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 8 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(8);
         *input = rest;
         Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_i128(input: &mut &[u8]) -> Result<i128, ProgramError> {
-        if input.len() < 16 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 16 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(16);
         *input = rest;
         Ok(i128::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_u128(input: &mut &[u8]) -> Result<u128, ProgramError> {
-        if input.len() < 16 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 16 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(16);
         *input = rest;
         Ok(u128::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_pubkey(input: &mut &[u8]) -> Result<Pubkey, ProgramError> {
-        if input.len() < 32 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 32 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(32);
         *input = rest;
         Ok(Pubkey::new_from_array(bytes.try_into().unwrap()))
     }
 
     fn read_bytes32(input: &mut &[u8]) -> Result<[u8; 32], ProgramError> {
-        if input.len() < 32 { return Err(ProgramError::InvalidInstructionData); }
+        if input.len() < 32 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
         let (bytes, rest) = input.split_at(32);
         *input = rest;
         Ok(bytes.try_into().unwrap())
@@ -1314,8 +1471,8 @@ pub mod ix {
 
 // 5. mod accounts (Pinocchio validation)
 pub mod accounts {
-    use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
     use crate::error::PercolatorError;
+    use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 
     pub fn expect_len(accounts: &[AccountInfo], n: usize) -> Result<(), ProgramError> {
         // Length check via verify helper (Kani-provable)
@@ -1363,12 +1520,12 @@ pub mod accounts {
 
 // 6. mod state
 pub mod state {
+    use crate::constants::{CONFIG_LEN, HEADER_LEN};
     use bytemuck::{Pod, Zeroable};
     use core::cell::RefMut;
     use core::mem::offset_of;
     use solana_program::account_info::AccountInfo;
     use solana_program::program_error::ProgramError;
-    use crate::constants::{HEADER_LEN, CONFIG_LEN};
 
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1460,7 +1617,9 @@ pub mod state {
         pub last_effective_price_e6: u64,
     }
 
-    pub fn slab_data_mut<'a, 'b>(ai: &'b AccountInfo<'a>) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
+    pub fn slab_data_mut<'a, 'b>(
+        ai: &'b AccountInfo<'a>,
+    ) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
         Ok(ai.try_borrow_mut_data()?)
     }
 
@@ -1495,7 +1654,11 @@ pub mod state {
 
     /// Read the last threshold update slot from _reserved[8..16].
     pub fn read_last_thr_update_slot(data: &[u8]) -> u64 {
-        u64::from_le_bytes(data[RESERVED_OFF + 8..RESERVED_OFF + 16].try_into().unwrap())
+        u64::from_le_bytes(
+            data[RESERVED_OFF + 8..RESERVED_OFF + 16]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Write the last threshold update slot to _reserved[8..16].
@@ -1505,7 +1668,11 @@ pub mod state {
 
     /// Read accumulated dust (base token remainder) from _reserved[16..24].
     pub fn read_dust_base(data: &[u8]) -> u64 {
-        u64::from_le_bytes(data[RESERVED_OFF + 16..RESERVED_OFF + 24].try_into().unwrap())
+        u64::from_le_bytes(
+            data[RESERVED_OFF + 16..RESERVED_OFF + 24]
+                .try_into()
+                .unwrap(),
+        )
     }
 
     /// Write accumulated dust (base token remainder) to _reserved[16..24].
@@ -1596,8 +1763,8 @@ pub mod units {
 
 // 8. mod oracle
 pub mod oracle {
-    use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
     use crate::error::PercolatorError;
+    use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 
     // SECURITY (H5): The "devnet" feature disables critical oracle safety checks:
     // - Staleness validation (stale prices accepted)
@@ -1609,40 +1776,38 @@ pub mod oracle {
     /// Pyth Solana Receiver program ID (same for mainnet and devnet)
     /// rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ
     pub const PYTH_RECEIVER_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-        0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48,
-        0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b, 0x90,
-        0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01,
-        0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38, 0x58, 0x81,
+        0x0c, 0xb7, 0xfa, 0xbb, 0x52, 0xf7, 0xa6, 0x48, 0xbb, 0x5b, 0x31, 0x7d, 0x9a, 0x01, 0x8b,
+        0x90, 0x57, 0xcb, 0x02, 0x47, 0x74, 0xfa, 0xfe, 0x01, 0xe6, 0xc4, 0xdf, 0x98, 0xcc, 0x38,
+        0x58, 0x81,
     ]);
 
     /// Chainlink OCR2 Store program ID (same for mainnet and devnet)
     /// HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny
     pub const CHAINLINK_OCR2_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
-        0xf1, 0x4b, 0xf6, 0x5a, 0xd5, 0x6b, 0xd2, 0xba,
-        0x71, 0x5e, 0x45, 0x74, 0x2c, 0x23, 0x1f, 0x27,
-        0xd6, 0x36, 0x21, 0xcf, 0x5b, 0x77, 0x8f, 0x37,
-        0xc1, 0xa2, 0x48, 0x95, 0x1d, 0x17, 0x56, 0x02,
+        0xf1, 0x4b, 0xf6, 0x5a, 0xd5, 0x6b, 0xd2, 0xba, 0x71, 0x5e, 0x45, 0x74, 0x2c, 0x23, 0x1f,
+        0x27, 0xd6, 0x36, 0x21, 0xcf, 0x5b, 0x77, 0x8f, 0x37, 0xc1, 0xa2, 0x48, 0x95, 0x1d, 0x17,
+        0x56, 0x02,
     ]);
 
     // PriceUpdateV2 account layout offsets (134 bytes minimum)
     // See: https://github.com/pyth-network/pyth-crosschain/blob/main/target_chains/solana/pyth_solana_receiver_sdk/src/price_update.rs
     const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
-    const OFF_FEED_ID: usize = 42;      // 32 bytes
-    const OFF_PRICE: usize = 74;        // i64
-    const OFF_CONF: usize = 82;         // u64
-    const OFF_EXPO: usize = 90;         // i32
+    const OFF_FEED_ID: usize = 42; // 32 bytes
+    const OFF_PRICE: usize = 74; // i64
+    const OFF_CONF: usize = 82; // u64
+    const OFF_EXPO: usize = 90; // i32
     const OFF_PUBLISH_TIME: usize = 94; // i64
 
     // Chainlink OCR2 State/Aggregator account layout offsets (devnet format)
     // This is the simpler account format used on Solana devnet
     // Note: Different from the Transmissions ring buffer format in older docs
-    const CL_MIN_LEN: usize = 224;       // Minimum required length
-    const CL_OFF_DECIMALS: usize = 138;  // u8 - number of decimals
-    // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
-    // The actual price data is stored directly at tail:
-    const CL_OFF_SLOT: usize = 200;      // u64 - slot when updated
+    const CL_MIN_LEN: usize = 224; // Minimum required length
+    const CL_OFF_DECIMALS: usize = 138; // u8 - number of decimals
+                                        // Skip unused: latest_round_id (143), live_length (148), live_cursor (152)
+                                        // The actual price data is stored directly at tail:
+    const CL_OFF_SLOT: usize = 200; // u64 - slot when updated
     const CL_OFF_TIMESTAMP: usize = 208; // u64 - unix timestamp (seconds)
-    const CL_OFF_ANSWER: usize = 216;    // i128 - price answer
+    const CL_OFF_ANSWER: usize = 216; // i128 - price answer
 
     // Maximum supported exponent to prevent overflow (10^18 fits in u128)
     const MAX_EXPO_ABS: i32 = 18;
@@ -1687,7 +1852,11 @@ pub mod oracle {
         let price = i64::from_le_bytes(data[OFF_PRICE..OFF_PRICE + 8].try_into().unwrap());
         let conf = u64::from_le_bytes(data[OFF_CONF..OFF_CONF + 8].try_into().unwrap());
         let expo = i32::from_le_bytes(data[OFF_EXPO..OFF_EXPO + 4].try_into().unwrap());
-        let publish_time = i64::from_le_bytes(data[OFF_PUBLISH_TIME..OFF_PUBLISH_TIME + 8].try_into().unwrap());
+        let publish_time = i64::from_le_bytes(
+            data[OFF_PUBLISH_TIME..OFF_PUBLISH_TIME + 8]
+                .try_into()
+                .unwrap(),
+        );
 
         if price <= 0 {
             return Err(PercolatorError::OracleInvalid.into());
@@ -1726,7 +1895,9 @@ pub mod oracle {
         let scale = expo + 6;
         let final_price_u128 = if scale >= 0 {
             let mul = 10u128.pow(scale as u32);
-            price_u.checked_mul(mul).ok_or(PercolatorError::EngineOverflow)?
+            price_u
+                .checked_mul(mul)
+                .ok_or(PercolatorError::EngineOverflow)?
         } else {
             let div = 10u128.pow((-scale) as u32);
             price_u / div
@@ -1781,12 +1952,13 @@ pub mod oracle {
 
         // Read price data directly from fixed offsets
         let timestamp = u64::from_le_bytes(
-            data[CL_OFF_TIMESTAMP..CL_OFF_TIMESTAMP + 8].try_into().unwrap()
+            data[CL_OFF_TIMESTAMP..CL_OFF_TIMESTAMP + 8]
+                .try_into()
+                .unwrap(),
         );
         // Read answer as i128 (16 bytes), but only bottom 8 bytes are typically used
-        let answer = i128::from_le_bytes(
-            data[CL_OFF_ANSWER..CL_OFF_ANSWER + 16].try_into().unwrap()
-        );
+        let answer =
+            i128::from_le_bytes(data[CL_OFF_ANSWER..CL_OFF_ANSWER + 16].try_into().unwrap());
 
         if answer <= 0 {
             return Err(PercolatorError::OracleInvalid.into());
@@ -1815,7 +1987,9 @@ pub mod oracle {
         let scale = 6i32 - decimals as i32;
         let final_price_u128 = if scale >= 0 {
             let mul = 10u128.pow(scale as u32);
-            price_u.checked_mul(mul).ok_or(PercolatorError::EngineOverflow)?
+            price_u
+                .checked_mul(mul)
+                .ok_or(PercolatorError::EngineOverflow)?
         } else {
             let div = 10u128.pow((-scale) as u32);
             price_u / div
@@ -1857,14 +2031,26 @@ pub mod oracle {
     ) -> Result<u64, ProgramError> {
         // Detect oracle type by account owner and dispatch
         let raw_price = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
-            read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)?
+            read_pyth_price_e6(
+                price_ai,
+                expected_feed_id,
+                now_unix_ts,
+                max_staleness_secs,
+                conf_bps,
+            )?
         } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
             read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)?
         } else {
             // In test mode, try Pyth format first (for existing tests)
             #[cfg(feature = "test")]
             {
-                read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)?
+                read_pyth_price_e6(
+                    price_ai,
+                    expected_feed_id,
+                    now_unix_ts,
+                    max_staleness_secs,
+                    conf_bps,
+                )?
             }
             #[cfg(not(feature = "test"))]
             {
@@ -1921,7 +2107,9 @@ pub mod oracle {
         now_unix_ts: i64,
     ) -> Result<u64, ProgramError> {
         // Try authority price first
-        if let Some(authority_price) = read_authority_price(config, now_unix_ts, config.max_staleness_secs) {
+        if let Some(authority_price) =
+            read_authority_price(config, now_unix_ts, config.max_staleness_secs)
+        {
             return Ok(authority_price);
         }
 
@@ -1958,7 +2146,11 @@ pub mod oracle {
         now_unix_ts: i64,
     ) -> Result<u64, ProgramError> {
         let raw = read_price_with_authority(config, price_ai, now_unix_ts)?;
-        let clamped = clamp_oracle_price(config.last_effective_price_e6, raw, config.oracle_price_cap_e2bps);
+        let clamped = clamp_oracle_price(
+            config.last_effective_price_e6,
+            raw,
+            config.oracle_price_cap_e2bps,
+        );
         config.last_effective_price_e6 = clamped;
         Ok(clamped)
     }
@@ -1981,13 +2173,16 @@ pub mod oracle {
     /// Security: When dt_slots == 0 (same slot) or cap_e2bps == 0 (cap disabled),
     /// returns index unchanged to prevent bypassing rate limits.
     pub fn clamp_toward_with_dt(index: u64, mark: u64, cap_e2bps: u64, dt_slots: u64) -> u64 {
-        if index == 0 { return mark; }
+        if index == 0 {
+            return mark;
+        }
         // Bug #9 fix: return index (no movement) when dt=0 or cap=0,
         // rather than mark (bypass rate limiting)
-        if cap_e2bps == 0 || dt_slots == 0 { return index; }
+        if cap_e2bps == 0 || dt_slots == 0 {
+            return index;
+        }
 
-        let max_delta_u128 =
-            (index as u128)
+        let max_delta_u128 = (index as u128)
             .saturating_mul(cap_e2bps as u128)
             .saturating_mul(dt_slots as u128)
             / 1_000_000u128;
@@ -2017,12 +2212,8 @@ pub mod oracle {
 
             let prev_index = config.last_effective_price_e6;
             let dt = now_slot.saturating_sub(engine_last_slot);
-            let new_index = clamp_toward_with_dt(
-                prev_index.max(1),
-                mark,
-                config.oracle_price_cap_e2bps,
-                dt,
-            );
+            let new_index =
+                clamp_toward_with_dt(prev_index.max(1), mark, config.oracle_price_cap_e2bps, dt);
 
             config.last_effective_price_e6 = new_index;
             return Ok(new_index);
@@ -2039,16 +2230,16 @@ pub mod oracle {
         mark_e6: u64,
         index_e6: u64,
         funding_horizon_slots: u64,
-        funding_k_bps: u64,       // 100 = 1.00x multiplier
-        max_premium_bps: i64,     // e.g. 500 = 5%
+        funding_k_bps: u64,   // 100 = 1.00x multiplier
+        max_premium_bps: i64, // e.g. 500 = 5%
         max_bps_per_slot: i64,
     ) -> i64 {
-        if mark_e6 == 0 || index_e6 == 0 || funding_horizon_slots == 0 { return 0; }
+        if mark_e6 == 0 || index_e6 == 0 || funding_horizon_slots == 0 {
+            return 0;
+        }
 
         let diff = mark_e6 as i128 - index_e6 as i128;
-        let mut premium_bps = diff
-            .saturating_mul(10_000)
-            / (index_e6 as i128);
+        let mut premium_bps = diff.saturating_mul(10_000) / (index_e6 as i128);
 
         // Clamp premium
         premium_bps = premium_bps.clamp(-(max_premium_bps as i128), max_premium_bps as i128);
@@ -2067,9 +2258,7 @@ pub mod oracle {
 
 // 9. mod collateral
 pub mod collateral {
-    use solana_program::{
-        account_info::AccountInfo, program_error::ProgramError,
-    };
+    use solana_program::{account_info::AccountInfo, program_error::ProgramError};
 
     #[cfg(not(feature = "test"))]
     use solana_program::program::{invoke, invoke_signed};
@@ -2084,9 +2273,11 @@ pub mod collateral {
         source: &AccountInfo<'a>,
         dest: &AccountInfo<'a>,
         _authority: &AccountInfo<'a>,
-        amount: u64
+        amount: u64,
     ) -> Result<(), ProgramError> {
-        if amount == 0 { return Ok(()); }
+        if amount == 0 {
+            return Ok(());
+        }
         #[cfg(not(feature = "test"))]
         {
             let ix = spl_token::instruction::transfer(
@@ -2097,18 +2288,32 @@ pub mod collateral {
                 &[],
                 amount,
             )?;
-            invoke(&ix, &[source.clone(), dest.clone(), _authority.clone(), _token_program.clone()])
+            invoke(
+                &ix,
+                &[
+                    source.clone(),
+                    dest.clone(),
+                    _authority.clone(),
+                    _token_program.clone(),
+                ],
+            )
         }
         #[cfg(feature = "test")]
         {
             let mut src_data = source.try_borrow_mut_data()?;
             let mut src_state = TokenAccount::unpack(&src_data)?;
-            src_state.amount = src_state.amount.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+            src_state.amount = src_state
+                .amount
+                .checked_sub(amount)
+                .ok_or(ProgramError::InsufficientFunds)?;
             TokenAccount::pack(src_state, &mut src_data)?;
 
             let mut dst_data = dest.try_borrow_mut_data()?;
             let mut dst_state = TokenAccount::unpack(&dst_data)?;
-            dst_state.amount = dst_state.amount.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?;
+            dst_state.amount = dst_state
+                .amount
+                .checked_add(amount)
+                .ok_or(ProgramError::InvalidAccountData)?;
             TokenAccount::pack(dst_state, &mut dst_data)?;
             Ok(())
         }
@@ -2122,7 +2327,9 @@ pub mod collateral {
         amount: u64,
         _signer_seeds: &[&[&[u8]]],
     ) -> Result<(), ProgramError> {
-        if amount == 0 { return Ok(()); }
+        if amount == 0 {
+            return Ok(());
+        }
         #[cfg(not(feature = "test"))]
         {
             let ix = spl_token::instruction::transfer(
@@ -2133,18 +2340,33 @@ pub mod collateral {
                 &[],
                 amount,
             )?;
-            invoke_signed(&ix, &[source.clone(), dest.clone(), _authority.clone(), _token_program.clone()], _signer_seeds)
+            invoke_signed(
+                &ix,
+                &[
+                    source.clone(),
+                    dest.clone(),
+                    _authority.clone(),
+                    _token_program.clone(),
+                ],
+                _signer_seeds,
+            )
         }
         #[cfg(feature = "test")]
         {
             let mut src_data = source.try_borrow_mut_data()?;
             let mut src_state = TokenAccount::unpack(&src_data)?;
-            src_state.amount = src_state.amount.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+            src_state.amount = src_state
+                .amount
+                .checked_sub(amount)
+                .ok_or(ProgramError::InsufficientFunds)?;
             TokenAccount::pack(src_state, &mut src_data)?;
 
             let mut dst_data = dest.try_borrow_mut_data()?;
             let mut dst_state = TokenAccount::unpack(&dst_data)?;
-            dst_state.amount = dst_state.amount.checked_add(amount).ok_or(ProgramError::InvalidAccountData)?;
+            dst_state.amount = dst_state
+                .amount
+                .checked_add(amount)
+                .ok_or(ProgramError::InvalidAccountData)?;
             TokenAccount::pack(dst_state, &mut dst_data)?;
             Ok(())
         }
@@ -2153,29 +2375,37 @@ pub mod collateral {
 
 // 9. mod processor
 pub mod processor {
-    use solana_program::{
-        account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey,
-        sysvar::{clock::Clock, Sysvar},
-        program_error::ProgramError,
-        program_pack::Pack,
-        msg,
-        log::{sol_log_compute_units, sol_log_64},
-    };
     use crate::{
+        accounts, collateral,
+        constants::{
+            CONFIG_LEN, DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+            DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_HYPERP_PRICE_CAP_E2BPS,
+            DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN,
+            DEFAULT_THRESH_MIN_STEP, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_STEP_BPS,
+            DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, MAGIC, MATCHER_CALL_LEN, MATCHER_CALL_TAG,
+            MATCHER_CONTEXT_LEN, MATCHER_CONTEXT_PREFIX_LEN, SLAB_LEN, VERSION,
+        },
+        error::{map_risk_error, PercolatorError},
         ix::Instruction,
-        state::{self, SlabHeader, MarketConfig},
-        accounts,
-        constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN, MATCHER_CONTEXT_LEN, MATCHER_CALL_TAG, MATCHER_CALL_LEN, MATCHER_CONTEXT_PREFIX_LEN,
-            DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6, DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
-            DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN_STEP,
-            DEFAULT_HYPERP_PRICE_CAP_E2BPS},
-        error::{PercolatorError, map_risk_error},
         oracle,
-        collateral,
+        state::{self, MarketConfig, SlabHeader},
         zc,
     };
-    use percolator::{RiskEngine, NoOpMatcher, MAX_ACCOUNTS, MatchingEngine, TradeExecution, RiskError};
-    use solana_program::instruction::{Instruction as SolInstruction, AccountMeta};
+    use percolator::{
+        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, TradeExecution, MAX_ACCOUNTS,
+    };
+    use solana_program::instruction::{AccountMeta, Instruction as SolInstruction};
+    use solana_program::{
+        account_info::AccountInfo,
+        entrypoint::ProgramResult,
+        log::{sol_log_64, sol_log_compute_units},
+        msg,
+        program_error::ProgramError,
+        program_pack::Pack,
+        pubkey::Pubkey,
+        sysvar::{clock::Clock, Sysvar},
+    };
 
     struct CpiMatcher {
         exec_price: u64,
@@ -2198,7 +2428,11 @@ pub mod processor {
         }
     }
 
-    fn slab_guard(program_id: &Pubkey, slab: &AccountInfo, data: &[u8]) -> Result<(), ProgramError> {
+    fn slab_guard(
+        program_id: &Pubkey,
+        slab: &AccountInfo,
+        data: &[u8],
+    ) -> Result<(), ProgramError> {
         // Slab shape validation via verify helper (Kani-provable)
         // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
         // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
@@ -2220,8 +2454,12 @@ pub mod processor {
 
     fn require_initialized(data: &[u8]) -> Result<(), ProgramError> {
         let h = state::read_header(data);
-        if h.magic != MAGIC { return Err(PercolatorError::NotInitialized.into()); }
-        if h.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
+        if h.magic != MAGIC {
+            return Err(PercolatorError::NotInitialized.into());
+        }
+        if h.version != VERSION {
+            return Err(PercolatorError::InvalidVersion.into());
+        }
         Ok(())
     }
 
@@ -2242,15 +2480,30 @@ pub mod processor {
         Ok(())
     }
 
-    fn verify_vault(a_vault: &AccountInfo, expected_owner: &Pubkey, expected_mint: &Pubkey, expected_pubkey: &Pubkey) -> Result<(), ProgramError> {
-        if a_vault.key != expected_pubkey { return Err(PercolatorError::InvalidVaultAta.into()); }
-        if a_vault.owner != &spl_token::ID { return Err(PercolatorError::InvalidVaultAta.into()); }
-        if a_vault.data_len() != spl_token::state::Account::LEN { return Err(PercolatorError::InvalidVaultAta.into()); }
+    fn verify_vault(
+        a_vault: &AccountInfo,
+        expected_owner: &Pubkey,
+        expected_mint: &Pubkey,
+        expected_pubkey: &Pubkey,
+    ) -> Result<(), ProgramError> {
+        if a_vault.key != expected_pubkey {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
+        if a_vault.owner != &spl_token::ID {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
+        if a_vault.data_len() != spl_token::state::Account::LEN {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
 
         let data = a_vault.try_borrow_data()?;
         let tok = spl_token::state::Account::unpack(&data)?;
-        if tok.mint != *expected_mint { return Err(PercolatorError::InvalidMint.into()); }
-        if tok.owner != *expected_owner { return Err(PercolatorError::InvalidVaultAta.into()); }
+        if tok.mint != *expected_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        if tok.owner != *expected_owner {
+            return Err(PercolatorError::InvalidVaultAta.into());
+        }
         // SECURITY (H3): Verify vault token account is initialized
         // Uninitialized vault could brick deposits/withdrawals
         if tok.state != spl_token::state::AccountState::Initialized {
@@ -2262,7 +2515,11 @@ pub mod processor {
     /// Verify a user's token account: owner, mint, and initialized state.
     /// Skip in tests to allow mock accounts.
     #[allow(unused_variables)]
-    fn verify_token_account(a_token_account: &AccountInfo, expected_owner: &Pubkey, expected_mint: &Pubkey) -> Result<(), ProgramError> {
+    fn verify_token_account(
+        a_token_account: &AccountInfo,
+        expected_owner: &Pubkey,
+        expected_mint: &Pubkey,
+    ) -> Result<(), ProgramError> {
         #[cfg(not(feature = "test"))]
         {
             if a_token_account.owner != &spl_token::ID {
@@ -2312,9 +2569,15 @@ pub mod processor {
 
         match instruction {
             Instruction::InitMarket {
-                admin, collateral_mint, index_feed_id,
-                max_staleness_secs, conf_filter_bps, invert, unit_scale,
-                initial_mark_price_e6, risk_params
+                admin,
+                collateral_mint,
+                index_feed_id,
+                max_staleness_secs,
+                conf_filter_bps,
+                invert,
+                unit_scale,
+                initial_mark_price_e6,
+                risk_params,
             } => {
                 // Reduced from 11 to 9: removed pyth_index and pyth_collateral accounts
                 // (feed_id is now passed in instruction data, not as account)
@@ -2342,8 +2605,8 @@ pub mod processor {
                 // Check owner == spl_token::ID and data length == Mint::LEN (82 bytes)
                 #[cfg(not(feature = "test"))]
                 {
-                    use spl_token::state::Mint;
                     use solana_program::program_pack::Pack;
+                    use spl_token::state::Mint;
                     if *a_mint.owner != spl_token::ID {
                         return Err(ProgramError::IllegalOwner);
                     }
@@ -2389,12 +2652,16 @@ pub mod processor {
                 let _ = zc::engine_mut(&mut data)?;
 
                 let header = state::read_header(&data);
-                if header.magic == MAGIC { return Err(PercolatorError::AlreadyInitialized.into()); }
+                if header.magic == MAGIC {
+                    return Err(PercolatorError::AlreadyInitialized.into());
+                }
 
                 let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault(a_vault, &auth, a_mint.key, a_vault.key)?;
 
-                for b in data.iter_mut() { *b = 0; }
+                for b in data.iter_mut() {
+                    *b = 0;
+                }
 
                 // Initialize engine in-place (zero-copy) to avoid stack overflow.
                 // The data is already zeroed above, so init_in_place only sets non-zero fields.
@@ -2441,7 +2708,11 @@ pub mod processor {
                     // Oracle price circuit breaker
                     // In Hyperp mode: used for rate-limited index smoothing AND mark price clamping
                     // Default: disabled for non-Hyperp, 1% per slot for Hyperp
-                    oracle_price_cap_e2bps: if is_hyperp { DEFAULT_HYPERP_PRICE_CAP_E2BPS } else { 0 },
+                    oracle_price_cap_e2bps: if is_hyperp {
+                        DEFAULT_HYPERP_PRICE_CAP_E2BPS
+                    } else {
+                        0
+                    },
                     last_effective_price_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
                 };
                 state::write_config(&mut data, &config);
@@ -2459,7 +2730,7 @@ pub mod processor {
                 state::write_req_nonce(&mut data, 0);
                 // Initialize threshold update slot to 0
                 state::write_last_thr_update_slot(&mut data, 0);
-            },
+            }
             Instruction::InitUser { fee_payment } => {
                 accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
@@ -2484,7 +2755,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 // Transfer base tokens to vault
@@ -2499,9 +2775,15 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
                 let idx = engine.add_user(units as u128).map_err(map_risk_error)?;
-                engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
-            },
-            Instruction::InitLP { matcher_program, matcher_context, fee_payment } => {
+                engine
+                    .set_owner(idx, a_user.key.to_bytes())
+                    .map_err(map_risk_error)?;
+            }
+            Instruction::InitLP {
+                matcher_program,
+                matcher_context,
+                fee_payment,
+            } => {
                 accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
@@ -2526,7 +2808,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 // Transfer base tokens to vault
@@ -2540,9 +2827,17 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-                let idx = engine.add_lp(matcher_program.to_bytes(), matcher_context.to_bytes(), units as u128).map_err(map_risk_error)?;
-                engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
-            },
+                let idx = engine
+                    .add_lp(
+                        matcher_program.to_bytes(),
+                        matcher_context.to_bytes(),
+                        units as u128,
+                    )
+                    .map_err(map_risk_error)?;
+                engine
+                    .set_owner(idx, a_user.key.to_bytes())
+                    .map_err(map_risk_error)?;
+            }
             Instruction::DepositCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 6)?;
                 let a_user = &accounts[0];
@@ -2569,7 +2864,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
@@ -2594,8 +2894,10 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                engine.deposit(user_idx, units as u128, clock.slot).map_err(map_risk_error)?;
-            },
+                engine
+                    .deposit(user_idx, units as u128, clock.slot)
+                    .map_err(map_risk_error)?;
+            }
             Instruction::WithdrawCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
@@ -2620,7 +2922,12 @@ pub mod processor {
                 let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 accounts::expect_key(a_vault_pda, &derived_pda)?;
 
-                verify_vault(a_vault, &derived_pda, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &derived_pda,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
@@ -2660,8 +2967,9 @@ pub mod processor {
                     .map_err(map_risk_error)?;
 
                 // Convert units back to base tokens for payout (checked to prevent silent overflow)
-                let base_to_pay = crate::units::units_to_base_checked(units_requested, config.unit_scale)
-                    .ok_or(PercolatorError::EngineOverflow)?;
+                let base_to_pay =
+                    crate::units::units_to_base_checked(units_requested, config.unit_scale)
+                        .ok_or(PercolatorError::EngineOverflow)?;
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -2678,8 +2986,11 @@ pub mod processor {
                     base_to_pay,
                     &signer_seeds,
                 )?;
-            },
-            Instruction::KeeperCrank { caller_idx, allow_panic } => {
+            }
+            Instruction::KeeperCrank {
+                caller_idx,
+                allow_panic,
+            } => {
                 use crate::constants::CRANK_NO_CALLER;
 
                 accounts::expect_len(accounts, 4)?;
@@ -2727,8 +3038,7 @@ pub mod processor {
                                 // PnL = position * (settlement_price - entry_price) / 1e6
                                 let entry = acc.entry_price as i128;
                                 let settle = settlement_price as i128;
-                                let pnl_delta = pos
-                                    .saturating_mul(settle.saturating_sub(entry))
+                                let pnl_delta = pos.saturating_mul(settle.saturating_sub(entry))
                                     / 1_000_000i128;
 
                                 // Add to PnL using set_pnl() to maintain pnl_pos_tot aggregate
@@ -2743,7 +3053,7 @@ pub mod processor {
                                 // settle_warmup_to_capital converts nothing (Bug #11).
                                 if new_pnl > 0 {
                                     let avail = (new_pnl as u128).saturating_sub(
-                                        engine.accounts[idx as usize].reserved_pnl as u128
+                                        engine.accounts[idx as usize].reserved_pnl as u128,
                                     );
                                     let period = engine.params.warmup_period_slots as u128;
                                     let slope = if period > 0 {
@@ -2758,14 +3068,19 @@ pub mod processor {
                                 }
 
                                 // Clear position
-                                engine.accounts[idx as usize].position_size = percolator::I128::ZERO;
+                                engine.accounts[idx as usize].position_size =
+                                    percolator::I128::ZERO;
                                 engine.accounts[idx as usize].entry_price = 0;
                             }
                         }
                     }
 
                     // Update crank cursor for next call
-                    engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 { 0 } else { end };
+                    engine.crank_cursor = if end >= percolator::MAX_ACCOUNTS as u16 {
+                        0
+                    } else {
+                        end
+                    };
                     engine.current_slot = clock.slot;
 
                     return Ok(());
@@ -2817,7 +3132,11 @@ pub mod processor {
                 let hyperp_funding_rate = if is_hyperp {
                     // Read previous funding rate (piecewise-constant: use stored rate, then update)
                     // authority_timestamp is reinterpreted as i64 funding rate in Hyperp mode
-                    let prev_rate = config.authority_timestamp;
+                    // Legacy states may still contain unix timestamps in this slot; clamp to policy.
+                    let prev_rate = config.authority_timestamp.clamp(
+                        -config.funding_max_bps_per_slot,
+                        config.funding_max_bps_per_slot,
+                    );
 
                     // Compute new rate from premium
                     let mark_e6 = config.authority_price_e6;
@@ -2854,7 +3173,11 @@ pub mod processor {
                 }
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
-                let effective_caller_idx = if permissionless { CRANK_NO_CALLER } else { caller_idx };
+                let effective_caller_idx = if permissionless {
+                    CRANK_NO_CALLER
+                } else {
+                    caller_idx
+                };
 
                 // Compute funding rate:
                 // - Hyperp mode: use pre-computed rate (avoids borrow conflict)
@@ -2881,7 +3204,15 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
-                let _outcome = engine.keeper_crank(effective_caller_idx, clock.slot, price, effective_funding_rate, allow_panic != 0).map_err(map_risk_error)?;
+                let _outcome = engine
+                    .keeper_crank(
+                        effective_caller_idx,
+                        clock.slot,
+                        price,
+                        effective_funding_rate,
+                        allow_panic != 0,
+                    )
+                    .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_end");
@@ -2894,7 +3225,9 @@ pub mod processor {
                     let scale = unit_scale as u64;
                     if dust_before >= scale {
                         let units_to_sweep = dust_before / scale;
-                        engine.top_up_insurance_fund(units_to_sweep as u128).map_err(map_risk_error)?;
+                        engine
+                            .top_up_insurance_fund(units_to_sweep as u128)
+                            .map_err(map_risk_error)?;
                         Some(dust_before % scale)
                     } else {
                         None
@@ -2912,16 +3245,11 @@ pub mod processor {
                 if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
                     let risk_units = crate::compute_system_risk_units(engine);
                     // Convert risk_units (contracts) to notional using price
-                    let risk_notional = risk_units
-                        .saturating_mul(price as u128)
-                        / 1_000_000;
+                    let risk_notional = risk_units.saturating_mul(price as u128) / 1_000_000;
                     // raw target: floor + risk_notional * thresh_risk_bps / 10000
-                    let raw_target = config.thresh_floor
-                        .saturating_add(
-                            risk_notional
-                                .saturating_mul(config.thresh_risk_bps as u128)
-                                / 10_000
-                        );
+                    let raw_target = config.thresh_floor.saturating_add(
+                        risk_notional.saturating_mul(config.thresh_risk_bps as u128) / 10_000,
+                    );
                     let clamped_target = raw_target.clamp(config.thresh_min, config.thresh_max);
                     let current = engine.risk_reduction_threshold();
                     // EWMA: new = alpha * target + (1 - alpha) * current
@@ -2941,7 +3269,9 @@ pub mod processor {
                     } else {
                         current.saturating_sub(max_step.min(current - smoothed))
                     };
-                    engine.set_risk_reduction_threshold(final_thresh.clamp(config.thresh_min, config.thresh_max));
+                    engine.set_risk_reduction_threshold(
+                        final_thresh.clamp(config.thresh_min, config.thresh_max),
+                    );
                     drop(engine);
                     state::write_last_thr_update_slot(&mut data, clock.slot);
                 }
@@ -2954,8 +3284,12 @@ pub mod processor {
                 // Debug: log lifetime counters (sol_log_64: tag, liqs, force, max_accounts, insurance)
                 msg!("CRANK_STATS");
                 sol_log_64(0xC8A4C, liqs, force, MAX_ACCOUNTS as u64, ins_low);
-            },
-            Instruction::TradeNoCpi { lp_idx, user_idx, size } => {
+            }
+            Instruction::TradeNoCpi {
+                lp_idx,
+                user_idx,
+                size,
+            } => {
                 accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
                 let a_lp = &accounts[1];
@@ -2986,7 +3320,8 @@ pub mod processor {
                 }
 
                 // Read oracle price with circuit-breaker clamping
-                let price = oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
+                let price =
+                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
@@ -3034,14 +3369,20 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
                     sol_log_compute_units();
                 }
-                engine.execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
+                engine
+                    .execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size)
+                    .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
                     sol_log_compute_units();
                 }
-            },
-            Instruction::TradeCpi { lp_idx, user_idx, size } => {
+            }
+            Instruction::TradeCpi {
+                lp_idx,
+                user_idx,
+                size,
+            } => {
                 // Phase 1: Updated account layout - lp_pda must be in accounts
                 accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
@@ -3075,10 +3416,13 @@ pub mod processor {
                 let lp_bytes = lp_idx.to_le_bytes();
                 let (expected_lp_pda, bump) = Pubkey::find_program_address(
                     &[b"lp", a_slab.key.as_ref(), &lp_bytes],
-                    program_id
+                    program_id,
                 );
                 // PDA key validation via verify helper (Kani-provable)
-                if !crate::verify::pda_key_matches(expected_lp_pda.to_bytes(), a_lp_pda.key.to_bytes()) {
+                if !crate::verify::pda_key_matches(
+                    expected_lp_pda.to_bytes(),
+                    a_lp_pda.key.to_bytes(),
+                ) {
                     return Err(ProgramError::InvalidSeeds);
                 }
                 // LP PDA shape validation via verify helper (Kani-provable)
@@ -3127,7 +3471,13 @@ pub mod processor {
                     }
 
                     let lp_acc = &engine.accounts[lp_idx as usize];
-                    (lp_acc.account_id, config, req_id, lp_acc.matcher_program, lp_acc.matcher_context)
+                    (
+                        lp_acc.account_id,
+                        config,
+                        req_id,
+                        lp_acc.matcher_program,
+                        lp_acc.matcher_context,
+                    )
                 };
 
                 // Matcher identity binding via verify helper (Kani-provable)
@@ -3209,7 +3559,10 @@ pub mod processor {
                 }
                 drop(ctx_data);
 
-                let matcher = CpiMatcher { exec_price: ret.exec_price_e6, exec_size: ret.exec_size };
+                let matcher = CpiMatcher {
+                    exec_price: ret.exec_price_e6,
+                    exec_size: ret.exec_size,
+                };
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     state::write_config(&mut data, &config);
@@ -3246,7 +3599,9 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_start");
                         sol_log_compute_units();
                     }
-                    engine.execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size).map_err(map_risk_error)?;
+                    engine
+                        .execute_trade(&matcher, lp_idx, user_idx, clock.slot, price, trade_size)
+                        .map_err(map_risk_error)?;
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
@@ -3270,7 +3625,7 @@ pub mod processor {
                         state::write_config(&mut data, &config);
                     }
                 }
-            },
+            }
             Instruction::LiquidateAtOracle { target_idx } => {
                 accounts::expect_len(accounts, 4)?;
                 let a_slab = &accounts[1];
@@ -3301,19 +3656,26 @@ pub mod processor {
                 check_idx(engine, target_idx)?;
 
                 // Debug logging for liquidation (using sol_log_64 for no_std)
-                sol_log_64(target_idx as u64, price, 0, 0, 0);  // idx, price
+                sol_log_64(target_idx as u64, price, 0, 0, 0); // idx, price
                 {
                     let acc = &engine.accounts[target_idx as usize];
-                    sol_log_64(acc.capital.get() as u64, acc.pnl.get() as u64, 0, 0, 1);  // cap, pnl
-                    sol_log_64(acc.position_size.get() as u64, acc.entry_price, 0, 0, 2);  // pos, entry
-                    // Calculate mark PnL
+                    sol_log_64(acc.capital.get() as u64, acc.pnl.get() as u64, 0, 0, 1); // cap, pnl
+                    sol_log_64(acc.position_size.get() as u64, acc.entry_price, 0, 0, 2); // pos, entry
+                                                                                          // Calculate mark PnL
                     let pos = acc.position_size.get();
                     let entry = acc.entry_price as i128;
                     let mark = pos.saturating_mul(price as i128 - entry) / 1_000_000;
-                    let equity = (acc.capital.get() as i128).saturating_add(acc.pnl.get()).saturating_add(mark);
-                    let notional = (if pos < 0 { -pos } else { pos } as u128).saturating_mul(price as u128) / 1_000_000;
-                    let maint_req = notional.saturating_mul(engine.params.maintenance_margin_bps as u128) / 10_000;
-                    sol_log_64(mark as u64, equity as u64, maint_req as u64, 0, 3);  // mark, equity, maint
+                    let equity = (acc.capital.get() as i128)
+                        .saturating_add(acc.pnl.get())
+                        .saturating_add(mark);
+                    let notional = (if pos < 0 { -pos } else { pos } as u128)
+                        .saturating_mul(price as u128)
+                        / 1_000_000;
+                    let maint_req = notional
+                        .saturating_mul(engine.params.maintenance_margin_bps as u128)
+                        / 10_000;
+                    sol_log_64(mark as u64, equity as u64, maint_req as u64, 0, 3);
+                    // mark, equity, maint
                 }
 
                 #[cfg(feature = "cu-audit")]
@@ -3321,14 +3683,16 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: liquidate_start");
                     sol_log_compute_units();
                 }
-                let _res = engine.liquidate_at_oracle(target_idx, clock.slot, price).map_err(map_risk_error)?;
-                sol_log_64(_res as u64, 0, 0, 0, 4);  // result
+                let _res = engine
+                    .liquidate_at_oracle(target_idx, clock.slot, price)
+                    .map_err(map_risk_error)?;
+                sol_log_64(_res as u64, 0, 0, 0, 4); // result
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: liquidate_end");
                     sol_log_compute_units();
                 }
-            },
+            }
             Instruction::CloseAccount { user_idx } => {
                 accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
@@ -3350,7 +3714,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
                 accounts::expect_key(a_pda, &auth)?;
 
@@ -3383,17 +3752,22 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: close_account_start");
                     sol_log_compute_units();
                 }
-                let amt_units = engine.close_account(user_idx, clock.slot, price).map_err(map_risk_error)?;
+                let amt_units = engine
+                    .close_account(user_idx, clock.slot, price)
+                    .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: close_account_end");
                     sol_log_compute_units();
                 }
-                let amt_units_u64: u64 = amt_units.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
+                let amt_units_u64: u64 = amt_units
+                    .try_into()
+                    .map_err(|_| PercolatorError::EngineOverflow)?;
 
                 // Convert units to base tokens for payout (checked to prevent silent overflow)
-                let base_to_pay = crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
-                    .ok_or(PercolatorError::EngineOverflow)?;
+                let base_to_pay =
+                    crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                        .ok_or(PercolatorError::EngineOverflow)?;
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -3402,8 +3776,15 @@ pub mod processor {
                 let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
                 let signer_seeds: [&[&[u8]]; 1] = [&seeds];
 
-                collateral::withdraw(a_token, a_vault, a_user_ata, a_pda, base_to_pay, &signer_seeds)?;
-            },
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_user_ata,
+                    a_pda,
+                    base_to_pay,
+                    &signer_seeds,
+                )?;
+            }
             Instruction::TopUpInsurance { amount } => {
                 accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
@@ -3429,7 +3810,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 // Transfer base tokens to vault
@@ -3443,8 +3829,10 @@ pub mod processor {
                 state::write_dust_base(&mut data, old_dust.saturating_add(dust));
 
                 let engine = zc::engine_mut(&mut data)?;
-                engine.top_up_insurance_fund(units as u128).map_err(map_risk_error)?;
-            },
+                engine
+                    .top_up_insurance_fund(units as u128)
+                    .map_err(map_risk_error)?;
+            }
             Instruction::SetRiskThreshold { new_threshold } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
@@ -3456,6 +3844,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
@@ -3535,10 +3926,19 @@ pub mod processor {
             }
 
             Instruction::UpdateConfig {
-                funding_horizon_slots, funding_k_bps, funding_inv_scale_notional_e6,
-                funding_max_premium_bps, funding_max_bps_per_slot,
-                thresh_floor, thresh_risk_bps, thresh_update_interval_slots,
-                thresh_step_bps, thresh_alpha_bps, thresh_min, thresh_max, thresh_min_step,
+                funding_horizon_slots,
+                funding_k_bps,
+                funding_inv_scale_notional_e6,
+                funding_max_premium_bps,
+                funding_max_bps_per_slot,
+                thresh_floor,
+                thresh_risk_bps,
+                thresh_update_interval_slots,
+                thresh_step_bps,
+                thresh_alpha_bps,
+                thresh_min,
+                thresh_max,
+                thresh_min_step,
             } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_admin = &accounts[0];
@@ -3550,6 +3950,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
@@ -3597,6 +4000,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
@@ -3616,6 +4022,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
@@ -3629,7 +4038,10 @@ pub mod processor {
                 state::write_config(&mut data, &config);
             }
 
-            Instruction::PushOraclePrice { price_e6, timestamp } => {
+            Instruction::PushOraclePrice {
+                price_e6,
+                timestamp,
+            } => {
                 accounts::expect_len(accounts, 2)?;
                 let a_authority = &accounts[0];
                 let a_slab = &accounts[1];
@@ -3640,9 +4052,13 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 // Verify caller is the oracle authority
                 let mut config = state::read_config(&data);
+                let is_hyperp = oracle::is_hyperp_mode(&config);
                 if config.oracle_authority == [0u8; 32] {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
@@ -3655,12 +4071,27 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
+                // For non-Hyperp markets, require monotonic authority timestamps.
+                // This prevents stale rollback pushes from replacing fresher authority data.
+                if !is_hyperp
+                    && config.authority_timestamp != 0
+                    && timestamp < config.authority_timestamp
+                {
+                    return Err(PercolatorError::OracleStale.into());
+                }
+
                 // Clamp the incoming price against circuit breaker
                 let clamped = oracle::clamp_oracle_price(
-                    config.last_effective_price_e6, price_e6, config.oracle_price_cap_e2bps
+                    config.last_effective_price_e6,
+                    price_e6,
+                    config.oracle_price_cap_e2bps,
                 );
                 config.authority_price_e6 = clamped;
-                config.authority_timestamp = timestamp;
+                // In Hyperp mode this field stores previous funding-rate state (bps/slot),
+                // not unix time. Keep it untouched so PushOraclePrice cannot clobber it.
+                if !is_hyperp {
+                    config.authority_timestamp = timestamp;
+                }
                 config.last_effective_price_e6 = clamped;
                 state::write_config(&mut data, &config);
             }
@@ -3676,6 +4107,9 @@ pub mod processor {
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
+                if state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
 
                 let header = state::read_header(&data);
                 require_admin(header.admin, a_admin.key)?;
@@ -3747,7 +4181,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 verify_token_account(a_admin_ata, a_admin.key, &mint)?;
                 accounts::expect_key(a_vault_pda, &auth)?;
 
@@ -3838,7 +4277,12 @@ pub mod processor {
                 let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(
+                    a_vault,
+                    &auth,
+                    &mint,
+                    &Pubkey::new_from_array(config.vault_pubkey),
+                )?;
                 accounts::expect_key(a_pda, &auth)?;
 
                 let clock = Clock::from_account_info(&accounts[6])?;
@@ -3886,13 +4330,16 @@ pub mod processor {
                 engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
 
                 // close_account: touch_account_full, free_slot, vault decrement
-                let amt_units = engine.close_account(user_idx, clock.slot, price)
+                let amt_units = engine
+                    .close_account(user_idx, clock.slot, price)
                     .map_err(map_risk_error)?;
-                let amt_units_u64: u64 = amt_units.try_into()
+                let amt_units_u64: u64 = amt_units
+                    .try_into()
                     .map_err(|_| PercolatorError::EngineOverflow)?;
 
-                let base_to_pay = crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
-                    .ok_or(PercolatorError::EngineOverflow)?;
+                let base_to_pay =
+                    crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                        .ok_or(PercolatorError::EngineOverflow)?;
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -3901,7 +4348,14 @@ pub mod processor {
                 let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
                 let signer_seeds: [&[&[u8]]; 1] = [&seeds];
 
-                collateral::withdraw(a_token, a_vault, a_owner_ata, a_pda, base_to_pay, &signer_seeds)?;
+                collateral::withdraw(
+                    a_token,
+                    a_vault,
+                    a_owner_ata,
+                    a_pda,
+                    base_to_pay,
+                    &signer_seeds,
+                )?;
             }
         }
         Ok(())
@@ -3910,12 +4364,12 @@ pub mod processor {
 
 // 10. mod entrypoint
 pub mod entrypoint {
+    use crate::processor;
     #[allow(unused_imports)]
     use alloc::format; // Required by entrypoint! macro in SBF builds
     use solana_program::{
         account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
     };
-    use crate::processor;
 
     entrypoint!(process_instruction);
 
@@ -3930,6 +4384,7 @@ pub mod entrypoint {
 
 // 11. mod risk (glue)
 pub mod risk {
-    pub use percolator::{RiskEngine, RiskParams, RiskError, NoOpMatcher, MatchingEngine, TradeExecution};
+    pub use percolator::{
+        MatchingEngine, NoOpMatcher, RiskEngine, RiskError, RiskParams, TradeExecution,
+    };
 }
-
