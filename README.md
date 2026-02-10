@@ -1,4 +1,4 @@
-# Purple 🟪 Percolator (Solana Program)
+# purple 🟪 percolator (Solana Program)
 
 > **⚠️ DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
 >
