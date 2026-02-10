@@ -7,8 +7,11 @@ extern crate alloc;
 
 use solana_program::declare_id;
 use solana_program::pubkey::Pubkey;
+use solana_security_txt::security_txt;
 
 declare_id!("GFzXiEhiRauw6k59L15zz4UJ9ZANaF5gpPtxEaYCo8jv");
+
+// Security contact metadata is embedded in the entrypoint module below
 
 // 1. mod constants
 pub mod constants {
@@ -827,12 +830,12 @@ pub mod verify {
 #[allow(unsafe_code)]
 pub mod zc {
     use crate::constants::{ENGINE_ALIGN, ENGINE_LEN, ENGINE_OFF};
-    use core::mem::offset_of;
+    // stable: use memoffset::offset_of! instead of core::mem::offset_of
     use percolator::RiskEngine;
     use solana_program::program_error::ProgramError;
 
     // Use const to export the actual offset for debugging
-    pub const ACCOUNTS_OFFSET: usize = offset_of!(RiskEngine, accounts);
+    pub const ACCOUNTS_OFFSET: usize = memoffset::offset_of!(RiskEngine, accounts);
 
     /// Old slab length (before Account struct reordering migration)
     /// Old slabs support up to 4095 accounts, new slabs support 4096.
@@ -1523,7 +1526,7 @@ pub mod state {
     use crate::constants::{CONFIG_LEN, HEADER_LEN};
     use bytemuck::{Pod, Zeroable};
     use core::cell::RefMut;
-    use core::mem::offset_of;
+    // stable: use memoffset::offset_of! instead of core::mem::offset_of
     use solana_program::account_info::AccountInfo;
     use solana_program::program_error::ProgramError;
 
@@ -1539,7 +1542,7 @@ pub mod state {
     }
 
     /// Offset of _reserved field in SlabHeader, derived from offset_of! for correctness.
-    pub const RESERVED_OFF: usize = offset_of!(SlabHeader, _reserved);
+    pub const RESERVED_OFF: usize = memoffset::offset_of!(SlabHeader, _reserved);
 
     // Portable compile-time assertion that RESERVED_OFF is 48 (expected layout)
     const _: [(); 48] = [(); RESERVED_OFF];
@@ -4376,12 +4379,12 @@ pub mod entrypoint {
     entrypoint!(process_instruction);
 
     security_txt! {
-        name: "Percolator",
+        name: "Purple Percolator",
         project_url: "https://purple.trade",
-        contacts: "email:security@purple.trade,link:https://github.com/purpletrade/percolator-prog/security",
-        policy: "https://purple.trade/docs/programs",
+        contacts: "email:tradeonpurple@proton.me,link:https://purple.trade/security",
+        policy: "https://purple.trade/security",
         source_code: "https://github.com/purpletrade/percolator-prog",
-        auditors: "Kani formal verification (risk engine)"
+        preferred_languages: "en"
     }
 
     fn process_instruction<'a>(

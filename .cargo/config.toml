@@ -1,0 +1,40 @@
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/BLAKE3-team/BLAKE3?tag=1.5.0"]
+git = "https://github.com/BLAKE3-team/BLAKE3"
+tag = "1.5.0"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/alexcrichton/jobserver-rs?tag=0.1.31"]
+git = "https://github.com/alexcrichton/jobserver-rs"
+tag = "0.1.31"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/bkchr/proc-macro-crate?tag=v3.0.1"]
+git = "https://github.com/bkchr/proc-macro-crate"
+tag = "v3.0.1"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/indexmap-rs/indexmap?tag=2.0.2"]
+git = "https://github.com/indexmap-rs/indexmap"
+tag = "2.0.2"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/near/borsh-rs?tag=borsh-v1.5.6"]
+git = "https://github.com/near/borsh-rs"
+tag = "borsh-v1.5.6"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/near/borsh-rs?tag=borsh-derive-v1.5.6"]
+git = "https://github.com/near/borsh-rs"
+tag = "borsh-derive-v1.5.6"
+replace-with = "vendored-sources"
+
+[source."git+https://github.com/purpletrade/percolator.git?rev=581dcaa"]
+git = "https://github.com/purpletrade/percolator.git"
+rev = "581dcaa"
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

@@ -22,23 +22,29 @@ solana-program = "1.18"
 spl-token = { version = "4.0", features = ["no-entrypoint"] }
 thiserror = "1.0"
 bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
-pyth-sdk-solana = "0.10"
+pyth-sdk-solana = "=0.10.3"
 pinocchio = "0.6"
 arrayref = "0.3"
 num-derive = "0.4"
 num-traits = "0.2"
 percolator = { git = "https://github.com/purpletrade/percolator.git", rev = "581dcaa" }
 solana-security-txt = "1.1.2"
+memoffset = "0.9"
 
 [dev-dependencies]
-bincode = "1"
-solana-sdk = "1.18"
-solana-client = "1.18"
-rand = "0.8"
-rand_xorshift = "0.3"
-proptest = "1.4"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-serial_test = "3"
-litesvm = "0.1"
-shellexpand = "3"
-serde_json = "1"
+# Intentionally left empty in the verifiable-build flow to minimize the metadata graph
+# and avoid pulling WASI/wit-bindgen-only crates that Cargo 1.75 cannot parse.
+
+[patch.crates-io]
+# Force a Cargo 1.75-compatible dependency graph for verifiable builds
+# Pin blake3 to 1.5.0 via git tag to avoid constant_time_eq 0.4.x (edition2024)
+blake3 = { git = "https://github.com/BLAKE3-team/BLAKE3", tag = "1.5.0" }
+# Pin jobserver to a release that does not pull getrandom 0.3.x
+jobserver = { git = "https://github.com/alexcrichton/jobserver-rs", tag = "0.1.31" }
+# Pin borsh 1.x to an MSRV compatible with rustc 1.75.0
+borsh = { git = "https://github.com/near/borsh-rs", tag = "borsh-v1.5.6" }
+borsh-derive = { git = "https://github.com/near/borsh-rs", tag = "borsh-derive-v1.5.6" }
+# Pin indexmap to a rustc 1.75-compatible release
+indexmap = { git = "https://github.com/indexmap-rs/indexmap", tag = "2.0.2" }
+# Downgrade proc-macro-crate to reduce toml_edit/indexmap MSRV
+proc-macro-crate = { git = "https://github.com/bkchr/proc-macro-crate", tag = "v3.0.1" }
