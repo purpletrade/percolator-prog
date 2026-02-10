@@ -2582,6 +2582,7 @@ dependencies = [
 [[package]]
 name = "percolator"
 version = "0.1.0"
+source = "git+https://github.com/purpletrade/percolator.git?rev=581dcaa#581dcaa38ae0f1420febf2c72deabf16103e55dd"
 
 [[package]]
 name = "percolator-prog"
