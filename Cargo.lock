@@ -2606,6 +2606,7 @@ dependencies = [
  "solana-client",
  "solana-program 1.18.26",
  "solana-sdk",
+ "solana-security-txt",
  "spl-token",
  "thiserror 1.0.69",
  "tokio",

@@ -8,7 +8,7 @@ extern crate alloc;
 use solana_program::declare_id;
 use solana_program::pubkey::Pubkey;
 
-declare_id!("Perco1ator111111111111111111111111111111111");
+declare_id!("GFzXiEhiRauw6k59L15zz4UJ9ZANaF5gpPtxEaYCo8jv");
 
 // 1. mod constants
 pub mod constants {
@@ -4371,7 +4371,18 @@ pub mod entrypoint {
         account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
     };
 
+    use solana_security_txt::security_txt;
+
     entrypoint!(process_instruction);
+
+    security_txt! {
+        name: "Percolator",
+        project_url: "https://purple.trade",
+        contacts: "email:security@purple.trade,link:https://github.com/purpletrade/percolator-prog/security",
+        policy: "https://purple.trade/docs/programs",
+        source_code: "https://github.com/purpletrade/percolator-prog",
+        auditors: "Kani formal verification (risk engine)"
+    }
 
     fn process_instruction<'a>(
         program_id: &Pubkey,
