@@ -1,0 +1,100 @@
+name: Check Upstream Sync
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Daily at 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for new upstream commits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: aeyakovenko/percolator-prog
+          LAST_SYNCED_COMMIT: d9bdfa2
+        run: |
+          set -euo pipefail
+
+          echo "Fetching upstream commit history..."
+          COMMITS=$(gh api "repos/${UPSTREAM_REPO}/commits?sha=main&per_page=50" \
+            --jq '.[].sha' 2>/dev/null) || {
+            echo "Failed to fetch upstream commits"
+            exit 0
+          }
+
+          # Check if our last synced commit is the latest
+          LATEST=$(echo "$COMMITS" | head -1)
+          LATEST_SHORT=$(echo "$LATEST" | cut -c1-7)
+          SYNCED_SHORT=$(echo "$LAST_SYNCED_COMMIT" | cut -c1-7)
+
+          echo "Upstream latest: $LATEST_SHORT"
+          echo "Our last sync:  $SYNCED_SHORT"
+
+          # Find how many commits ahead upstream is
+          AHEAD=0
+          while IFS= read -r sha; do
+            SHORT=$(echo "$sha" | cut -c1-7)
+            if [[ "$SHORT" == "$SYNCED_SHORT"* ]] || [[ "$sha" == "$LAST_SYNCED_COMMIT"* ]]; then
+              break
+            fi
+            AHEAD=$((AHEAD + 1))
+          done <<< "$COMMITS"
+
+          if [[ $AHEAD -eq 0 ]]; then
+            echo "Up to date with upstream."
+            exit 0
+          fi
+
+          echo "Upstream is $AHEAD commits ahead."
+
+          # Get commit summaries
+          COMMIT_LIST=$(gh api "repos/${UPSTREAM_REPO}/commits?sha=main&per_page=${AHEAD}" \
+            --jq '.[] | "- [`" + (.sha | .[0:7]) + "`](https://github.com/'"${UPSTREAM_REPO}"'/commit/" + .sha + ") " + (.commit.message | split("\n") | .[0])' 2>/dev/null)
+
+          # Check for existing open issue
+          EXISTING=$(gh issue list --label "upstream-sync" --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          BODY="$(cat <<ISSUEEOF
+          ## Upstream has $AHEAD new commit(s)
+
+          **Upstream repo:** https://github.com/${UPSTREAM_REPO}
+          **Our last sync:** \`${LAST_SYNCED_COMMIT}\`
+          **Upstream latest:** \`${LATEST_SHORT}\`
+
+          ### New commits
+
+          ${COMMIT_LIST}
+
+          ### Sync checklist
+
+          - [ ] Review upstream changes: \`git diff ${SYNCED_SHORT}..upstream/main -- src/percolator.rs\`
+          - [ ] Cherry-pick or merge relevant commits to a sync branch
+          - [ ] Do NOT overwrite: Cargo.lock, .cargo/config.toml, vendor/, .github/, scripts/, CLAUDE.md
+          - [ ] If deps changed: update Cargo.toml, regenerate lockfile, re-vendor
+          - [ ] Verify lockfile pins: blake3=1.5.0, solana-program=1.18.x
+          - [ ] Run CI build on sync branch
+          - [ ] Update \`LAST_SYNCED_COMMIT\` in upstream-sync.yml and CLAUDE.md
+          ISSUEEOF
+          )"
+
+          if [[ -n "$EXISTING" ]]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+            echo "Updated existing issue #$EXISTING"
+          else
+            gh issue create \
+              --title "Upstream sync: ${AHEAD} new commit(s) since ${SYNCED_SHORT}" \
+              --body "$BODY" \
+              --label "upstream-sync"
+            echo "Created new sync issue"
+          fi
