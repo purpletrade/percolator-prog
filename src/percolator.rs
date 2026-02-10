@@ -2440,9 +2440,13 @@ pub mod processor {
         // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
         // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
         const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
+        // Accept oversized slab from initial mainnet deployment (extra tail bytes are inert)
+        const OVERSIZED_SLAB_LEN: usize = 1_111_392;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN
+                || data.len() == OLD_SLAB_LEN
+                || data.len() == OVERSIZED_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
