@@ -9,7 +9,7 @@ use solana_program::declare_id;
 use solana_program::pubkey::Pubkey;
 use solana_security_txt::security_txt;
 
-declare_id!("GFzXiEhiRauw6k59L15zz4UJ9ZANaF5gpPtxEaYCo8jv");
+declare_id!("PRPLUgjCUxCEzNPP6x7XJVK1WR5XX28Zu8MEyTqvGjF");
 
 // Security contact metadata is embedded in the entrypoint module below
 

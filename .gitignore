@@ -6,3 +6,7 @@
 # Security research (gitignored)
 /research/
 /research/**
+
+# Program keypairs (NEVER commit)
+*-keypair.json
+*.keypair.json
