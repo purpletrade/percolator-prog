@@ -1,0 +1,49 @@
+name: Verified SBF Build (Solana 1.18.x)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Build in verifiable-build image (linux/amd64)
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD:/work" -w /work \
+            solanafoundation/solana-verifiable-build:1.18.9 \
+            bash -lc '
+              set -euxo pipefail
+
+              # Install Rust 1.75.0 — this image has no cargo binary
+              export RUSTUP_HOME=/tmp/rustup CARGO_HOME=/tmp/cargo
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.75.0
+              export PATH="/tmp/cargo/bin:$PATH"
+
+              cargo --version
+              solana --version
+              cargo-build-sbf --version
+              cargo-build-sbf --force-tools-install --sbf-out-dir target/deploy -- --locked
+            '
+
+      - name: Fix permissions and compute SHA256
+        run: |
+          sudo chown -R $(id -u):$(id -g) target/deploy
+          shasum -a 256 target/deploy/percolator_prog.so | tee target/deploy/percolator_prog.so.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: percolator-prog-sbf-1.18.9
+          path: |
+            target/deploy/percolator_prog.so
+            target/deploy/percolator_prog.so.sha256
