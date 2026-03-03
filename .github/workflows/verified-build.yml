@@ -32,7 +32,7 @@ jobs:
               cargo --version
               solana --version
               cargo-build-sbf --version
-              cargo-build-sbf --force-tools-install --sbf-out-dir target/deploy -- --locked
+              cargo-build-sbf --force-tools-install --sbf-out-dir target/deploy -- --locked --features unsafe_close
             '
 
       - name: Fix permissions and compute SHA256
